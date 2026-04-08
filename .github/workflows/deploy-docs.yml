@@ -49,6 +49,18 @@ jobs:
         run: |
           mkdir -p website/link-check-root
           ln -s "$PWD/website/build" website/link-check-root/beads
+          find website/build -type f -name '*.html' | while read -r file; do
+            rel="${file#website/build/}"
+            if [[ "$rel" == */index.html ]]; then
+              rel="${rel%/index.html}"
+            else
+              rel="${rel%.html}"
+            fi
+            [[ -z "$rel" ]] && continue
+            link="website/link-check-root/beads/$rel"
+            mkdir -p "$(dirname "$link")"
+            ln -sfn "$PWD/$file" "$link"
+          done
 
       - name: Check internal links
         uses: lycheeverse/lychee-action@v2
