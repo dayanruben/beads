@@ -222,6 +222,7 @@ uncommitted changes in its working set).`,
 					fmt.Fprintln(os.Stderr, "Supported remote URLs:")
 					fmt.Fprintln(os.Stderr, "  • GitHub (via git):   git+ssh://git@github.com/org/repo.git")
 					fmt.Fprintln(os.Stderr, "  • DoltHub:            https://doltremoteapi.dolthub.com/org/repo")
+					fmt.Fprintln(os.Stderr, "  • Azure Blob Storage: az://account.blob.core.windows.net/container/path")
 				} else if isDivergedHistoryErr(err) {
 					printDivergedHistoryGuidance("push --force")
 				}
@@ -244,6 +245,7 @@ uncommitted changes in its working set).`,
 					fmt.Fprintln(os.Stderr, "Supported remote URLs:")
 					fmt.Fprintln(os.Stderr, "  • GitHub (via git):   git+ssh://git@github.com/org/repo.git")
 					fmt.Fprintln(os.Stderr, "  • DoltHub:            https://doltremoteapi.dolthub.com/org/repo")
+					fmt.Fprintln(os.Stderr, "  • Azure Blob Storage: az://account.blob.core.windows.net/container/path")
 				} else if isDivergedHistoryErr(err) {
 					printDivergedHistoryGuidance("push")
 				}
@@ -684,7 +686,9 @@ var doltRemoteAddCmd = &cobra.Command{
 		}
 		cliURL := doltutil.FindCLIRemote(dbPath, name)
 
-		// Prompt for overwrite if either surface already has this remote
+		// Prompt for overwrite if either surface already has this remote.
+		// In embedded mode SQL and CLI share the same directory, so only
+		// prompt once — the SQL remove handles both.
 		if sqlURL != "" && sqlURL != url {
 			if !confirmOverwrite("SQL server", name, sqlURL, url) {
 				fmt.Println("Canceled.")
@@ -696,7 +700,7 @@ var doltRemoteAddCmd = &cobra.Command{
 				os.Exit(1)
 			}
 		}
-		if cliURL != "" && cliURL != url {
+		if !isEmbeddedMode() && cliURL != "" && cliURL != url {
 			if !confirmOverwrite("CLI (filesystem)", name, cliURL, url) {
 				fmt.Println("Canceled.")
 				return
@@ -730,6 +734,19 @@ var doltRemoteAddCmd = &cobra.Command{
 				fmt.Fprintf(os.Stderr, "Warning: SQL remote added but CLI remote failed: %v\n", err)
 				fmt.Fprintf(os.Stderr, "Run: cd %s && dolt remote add %s %s\n",
 					doltutil.ShellQuote(dbPath), doltutil.ShellQuote(name), doltutil.ShellQuote(url))
+			}
+		}
+
+		// Persist the origin remote URL to config.yaml as sync.remote
+		// so fresh clones can bootstrap from it (the Dolt database is
+		// gitignored and won't survive clone).
+		if name == "origin" {
+			if err := config.SetYamlConfig("sync.remote", url); err != nil {
+				FatalError("failed to persist sync.remote to config.yaml: %v", err)
+			}
+			// Auto-commit the config change so it's not left dirty.
+			if isGitRepo() {
+				commitBeadsConfig("bd: update sync.remote")
 			}
 		}
 
@@ -934,6 +951,19 @@ var doltRemoteRemoveCmd = &cobra.Command{
 		if sqlURL == "" && cliURL == "" {
 			fmt.Fprintf(os.Stderr, "Error: remote %q not found on either surface\n", name)
 			os.Exit(1)
+		}
+
+		// Clear sync.remote from config.yaml if the origin remote was removed,
+		// so fresh clones don't try to bootstrap from a stale URL.
+		if name == "origin" {
+			if current := config.GetYamlConfig("sync.remote"); current != "" {
+				if err := config.UnsetYamlConfig("sync.remote"); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to clear sync.remote from config.yaml: %v\n", err)
+				}
+				if isGitRepo() {
+					commitBeadsConfig("bd: clear sync.remote")
+				}
+			}
 		}
 
 		suffix := "(SQL + CLI)"
@@ -1482,6 +1512,7 @@ func openDoltServerConnection() (*sql.DB, func()) {
 		Port:     port,
 		User:     user,
 		Password: password,
+		TLS:      cfg.GetDoltServerTLS(),
 	}.String()
 
 	db, err := sql.Open("mysql", connStr)
