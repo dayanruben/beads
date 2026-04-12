@@ -244,11 +244,14 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			prefix = filepath.Base(cwd)
 		}
 
-		// Normalize prefix: strip leading dots and trailing hyphens.
-		// Leading dots produce invalid Dolt database names (e.g. ".claude" -> "bd_.claude").
-		// The trailing hyphen is added automatically during ID generation.
+		// Normalize prefix before storing it in config or deriving the Dolt
+		// database name. Dots are not valid in issue prefixes and must match the
+		// underscore form used for DoltDatabase/metadata.json.
+		// Leading dots produce invalid names (e.g. ".claude" -> "claude"), and
+		// the trailing hyphen is added automatically during ID generation.
 		prefix = strings.TrimLeft(prefix, ".")
 		prefix = strings.TrimRight(prefix, "-")
+		prefix = strings.ReplaceAll(prefix, ".", "_")
 
 		// Sanitize prefix for use as a MySQL database name.
 		// Directory names like "001" (common in temp dirs) are invalid because
@@ -348,6 +351,17 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				FatalError("failed to create .beads directory: %v", err)
 			}
 
+			// On Linux btrfs, disable transparent compression on .beads/ so that
+			// dolt's hot append-only write path (under .beads/dolt/ or
+			// .beads/embeddeddolt/) does not trigger kworker thrashing from
+			// read-modify-write-recompress cycles. New files created inside this
+			// directory inherit FS_NOCOW_FL automatically, so setting it here —
+			// before dolt writes anything — covers both server and embedded modes.
+			// No-op on non-Linux and non-btrfs filesystems (GH nocow-beads-dolt-init).
+			if err := applyNoCOW(beadsDir); err != nil && !quiet {
+				fmt.Fprintf(os.Stderr, "Warning: failed to set FS_NOCOW_FL on %s: %v\n", beadsDir, err)
+			}
+
 			// Create/update .gitignore in .beads directory (only if missing or outdated)
 			gitignorePath := filepath.Join(beadsDir, ".gitignore")
 			check := doctor.CheckGitignore(cwd)
@@ -410,6 +424,12 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		if initServerMode {
 			if err := os.MkdirAll(initDBPath, config.BeadsDirPerm); err != nil {
 				FatalError("failed to create storage directory %s: %v", initDBPath, err)
+			}
+			// Linux btrfs: disable compression on the dolt data dir to avoid
+			// kworker thrashing on the append-only write path. Best-effort; a
+			// non-btrfs filesystem returns nil from applyNoCOW.
+			if err := applyNoCOW(initDBPath); err != nil && !quiet {
+				fmt.Fprintf(os.Stderr, "Warning: failed to set FS_NOCOW_FL on %s: %v\n", initDBPath, err)
 			}
 		}
 
@@ -594,7 +614,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// avoid clobbering when multiple rigs share the same Dolt database)
 		existing, _ := store.GetConfig(ctx, "issue_prefix")
 		if existing == "" {
-			if err := store.SetConfig(ctx, "issue_prefix", prefix); err != nil {
+			// Sanitize dots to underscores so issue IDs (e.g. "GPUPolynomials_jl-1")
+			// remain valid identifiers. Must match DoltDatabase sanitization above.
+			issuePrefix := strings.ReplaceAll(prefix, ".", "_")
+			if err := store.SetConfig(ctx, "issue_prefix", issuePrefix); err != nil {
 				_ = store.Close()
 				FatalError("failed to set issue prefix: %v", err)
 			}
