@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/lockfile"
-	"github.com/steveyegge/beads/internal/storage/db/pidfile"
-	"github.com/steveyegge/beads/internal/storage/db/server"
-	"github.com/steveyegge/beads/internal/storage/db/util"
+	"github.com/steveyegge/beads/internal/storage/dbproxy/pidfile"
+	"github.com/steveyegge/beads/internal/storage/dbproxy/server"
+	"github.com/steveyegge/beads/internal/storage/dbproxy/util"
 )
 
 const (
@@ -29,7 +29,7 @@ func Shutdown(rootDir string) error {
 	if err := shutdownPair(rootDir, server.LockFileName, server.PIDFileName); err != nil {
 		return fmt.Errorf("proxy.Shutdown: dolt sql-server: %w", err)
 	}
-	if err := shutdownPair(rootDir, lockFileName, PIDFileName); err != nil {
+	if err := shutdownPair(rootDir, LockFileName, PIDFileName); err != nil {
 		return fmt.Errorf("proxy.Shutdown: proxy: %w", err)
 	}
 	return nil
