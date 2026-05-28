@@ -838,6 +838,14 @@ var rootCmd = &cobra.Command{
 			preserveRedirectSourceDatabase(beads.GetRedirectInfo().LocalDir)
 		}
 
+		if dbPath == "" {
+			if bd := beads.FindBeadsDir(); bd != "" {
+				if cfg, _ := configfile.Load(bd); cfg != nil && cfg.IsDoltProxiedServerMode() {
+					dbPath = bd
+				}
+			}
+		}
+
 		// Initialize database path
 		if dbPath == "" {
 			// Use public API to find database (same logic as extensions)
@@ -965,6 +973,12 @@ var rootCmd = &cobra.Command{
 			doltCfg.ServerPassword = cfg.GetDoltServerPasswordForPort(doltCfg.ServerPort)
 			doltCfg.ServerTLS = cfg.GetDoltServerTLS()
 		} else if cfgErr == nil {
+			metadataPath := filepath.Join(beadsDir, configfile.ConfigFileName)
+			configYAMLPath := filepath.Join(beadsDir, "config.yaml")
+			_, metadataErr := os.Stat(metadataPath)
+			_, yamlErr := os.Stat(configYAMLPath)
+			debug.Logf("Debug: config discovery at %s -> metadata=%v (%v), config.yaml=%v (%v)\n",
+				beadsDir, metadataErr == nil, metadataErr, yamlErr == nil, yamlErr)
 			// Load returned (nil, nil) — no config file found.
 			// Fall back to the canonical default database name; matches the
 			// behavior of newDoltStoreFromConfig / newReadOnlyStoreFromConfig
