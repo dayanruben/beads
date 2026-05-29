@@ -208,7 +208,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			fmt.Fprintf(os.Stderr, "  bd init\n\n")
 			fmt.Fprintf(os.Stderr, "To import issues from an existing JSONL export:\n")
 			fmt.Fprintf(os.Stderr, "  bd init --from-jsonl\n\n")
-			fmt.Fprintf(os.Stderr, "See: https://github.com/steveyegge/beads/blob/main/docs/DOLT-BACKEND.md\n")
+			fmt.Fprintf(os.Stderr, "See: https://github.com/gastownhall/beads/blob/main/docs/DOLT.md\n")
 			os.Exit(1)
 		} else if backendFlag != "" && backendFlag != "dolt" {
 			FatalError("unknown backend %q: only \"dolt\" is supported", backendFlag)
@@ -960,7 +960,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// remote even before refs/dolt/data exists; the first bd dolt push
 		// creates that ref. This keeps the default path durable without
 		// falling back to JSONL-as-sync.
-		if shouldWireInitRemote(syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin) {
+		if shouldConfigureInitDoltRemote(syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin, isDoltLocalOnly()) {
 			configureInitDoltRemote(ctx, store, syncURL, quiet)
 		}
 
@@ -1463,7 +1463,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 					fmt.Printf("  Skipping %s generation in bare repository\n", resolvedAgentsFile)
 				}
 			} else {
-				renderOpts := agents.RenderOpts{HasRemote: shouldWireInitRemote(syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin)}
+				renderOpts := agents.RenderOpts{HasRemote: shouldConfigureInitDoltRemote(syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin, isDoltLocalOnly())}
 				addAgentsInstructions(resolvedAgentsFile, !quiet, agentsTemplate, agentsProfile, renderOpts)
 			}
 		}
@@ -2122,6 +2122,14 @@ func shouldWireInitRemote(syncURL string, syncFromRemote, syncURLFromConfig, syn
 	// still keep explicit empty --remote as an opt-out because that leaves
 	// syncURL empty and syncURLFromGitOrigin false.
 	return syncURL != "" && (syncFromRemote || syncURLFromConfig || syncURLFromGitOrigin)
+}
+
+func shouldConfigureInitDoltRemote(syncURL string, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin, localOnly bool) bool {
+	return !localOnly && shouldWireInitRemote(syncURL, syncFromRemote, syncURLFromConfig, syncURLFromGitOrigin)
+}
+
+func isDoltLocalOnly() bool {
+	return config.GetBool("dolt.local-only")
 }
 
 func configureInitDoltRemote(ctx context.Context, store storage.DoltStorage, syncURL string, quiet bool) {

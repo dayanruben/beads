@@ -78,6 +78,9 @@ var YamlOnlyKeys = map[string]bool{
 	"linear.api_key":             true,
 	"linear.oauth_client_id":     true,
 	"linear.oauth_client_secret": true,
+	"jira.api_token":             true,
+	"gitlab.token":               true,
+	"ado.pat":                    true,
 }
 
 // IsYamlOnlyKey returns true if the given key should be stored in config.yaml
@@ -516,21 +519,6 @@ func isDuration(s string) bool {
 		return false
 	}
 	return isNumeric(s[:len(s)-1])
-}
-
-func needsQuoting(s string) bool {
-	// Quote if contains special YAML characters
-	special := []string{":", "#", "[", "]", "{", "}", ",", "&", "*", "!", "|", ">", "'", "\"", "%", "@", "`"}
-	for _, c := range special {
-		if strings.Contains(s, c) {
-			return true
-		}
-	}
-	// Quote if starts/ends with whitespace
-	if strings.TrimSpace(s) != s {
-		return true
-	}
-	return false
 }
 
 // validateYamlConfigValue validates a configuration value before setting.
