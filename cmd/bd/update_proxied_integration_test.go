@@ -123,6 +123,83 @@ func TestProxiedServerUpdate(t *testing.T) {
 		}
 	})
 
+	// Parity with the non-proxied TestMultiIDUpdatePartialFailureExitsNonzero:
+	// a generic per-ID failure (a bogus ID) between two good IDs must exit
+	// non-zero and name the failed ID, while the good IDs stay applied. Before
+	// the proxied-parity fix the proxied path returned exit 0 whenever another
+	// ID succeeded, hiding the failure from exit-code automation.
+	t.Run("generic_batch_partial_failure_exits_nonzero", func(t *testing.T) {
+		t.Parallel()
+		p := newSharedProxiedProject(t, bd, "ugbp")
+		good1 := bdProxiedCreate(t, bd, p.dir, "Batch good 1")
+		good2 := bdProxiedCreate(t, bd, p.dir, "Batch good 2")
+		const bogus = "ugbp-zzzzzzzzzz" // cannot collide with generated IDs
+
+		out := bdProxiedUpdateFail(t, bd, p.dir, good1.ID, bogus, good2.ID, "--priority", "0")
+		if !strings.Contains(out, bogus) {
+			t.Errorf("expected failed ID %s in output, got: %s", bogus, out)
+		}
+		// The command is per-ID, not atomic: both good IDs must still be applied.
+		for _, id := range []string{good1.ID, good2.ID} {
+			if got := bdProxiedShow(t, bd, p.dir, id); got.Priority != 0 {
+				t.Errorf("issue %s priority = %d, want 0 (successful IDs must stay applied)", id, got.Priority)
+			}
+		}
+	})
+
+	// The --json partial-failure contract on the proxied path: stdout keeps the
+	// array-of-updated-issues success shape and the last stderr line is the
+	// machine-parseable failed-ID report, matching the non-proxied path.
+	t.Run("generic_batch_partial_failure_json_reports_failed_ids", func(t *testing.T) {
+		t.Parallel()
+		p := newSharedProxiedProject(t, bd, "ugbj")
+		good1 := bdProxiedCreate(t, bd, p.dir, "JSON good 1")
+		good2 := bdProxiedCreate(t, bd, p.dir, "JSON good 2")
+		const bogus = "ugbj-zzzzzzzzzz"
+
+		stdout, stderr, err := bdProxiedUpdateRaw(t, bd, p.dir, "--json", good1.ID, bogus, good2.ID, "--priority", "0")
+		if err == nil {
+			t.Fatalf("proxied --json batch with a bogus ID exited 0, want non-zero\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+		}
+
+		// stdout keeps the success array of the two updated issues.
+		start := strings.Index(stdout, "[")
+		if start < 0 {
+			t.Fatalf("no JSON success array on stdout:\n%s", stdout)
+		}
+		var updated []*types.Issue
+		if uerr := json.Unmarshal([]byte(stdout[start:]), &updated); uerr != nil {
+			t.Fatalf("stdout is not the array-of-issues success shape: %v\n%s", uerr, stdout)
+		}
+		gotIDs := map[string]bool{}
+		for _, u := range updated {
+			gotIDs[u.ID] = true
+		}
+		if len(updated) != 2 || !gotIDs[good1.ID] || !gotIDs[good2.ID] {
+			t.Errorf("stdout success array = %v, want exactly the two good IDs %s %s", updated, good1.ID, good2.ID)
+		}
+
+		// The last stderr line is a JSON failure report naming the bogus ID.
+		lines := strings.Split(strings.TrimSpace(stderr), "\n")
+		last := lines[len(lines)-1]
+		var report struct {
+			Error  string `json:"error"`
+			Failed []struct {
+				ID    string `json:"id"`
+				Error string `json:"error"`
+			} `json:"failed"`
+		}
+		if uerr := json.Unmarshal([]byte(last), &report); uerr != nil {
+			t.Fatalf("last stderr line is not a JSON failure report: %v\nstderr:\n%s", uerr, stderr)
+		}
+		if report.Error == "" {
+			t.Errorf("JSON failure report has empty error message: %s", last)
+		}
+		if len(report.Failed) != 1 || report.Failed[0].ID != bogus {
+			t.Errorf("JSON failure report failed list = %+v, want exactly one entry for %s", report.Failed, bogus)
+		}
+	})
+
 	t.Run("add_remove_labels", func(t *testing.T) {
 		t.Parallel()
 		p := newSharedProxiedProject(t, bd, "ul")
@@ -1243,6 +1320,140 @@ func TestProxiedServerUpdateConcurrentClaim(t *testing.T) {
 	}
 	if len(winners) == 1 && assignee != winners[0] {
 		t.Errorf("final assignee: got %q, want %q (the actor that won the CAS)", assignee, winners[0])
+	}
+}
+
+// TestProxiedServerUpdateConcurrentMetadata is the proxied-server flavor of
+// the concurrent-metadata lost-update regression test: real bd processes in
+// proxied-server mode racing `bd update --set-metadata` with DISTINCT keys on
+// the SAME issue. Every writer that exits 0 must have its key in the final
+// metadata, and the seed key must survive.
+//
+// Before the fix this route lost writes two ways: buildUpdateSpecForIssue
+// merged metadata from the unit of work's MVCC snapshot (erasing keys a
+// concurrent writer committed after the snapshot), and when Dolt's commit-time
+// merge rolled the loser back, uow.CommitWithRetries re-committed the
+// now-empty session — Dolt said "nothing to commit", the handler swallowed it,
+// printed "✓ Updated", and exited 0 with the write gone.
+func TestProxiedServerUpdateConcurrentMetadata(t *testing.T) {
+	requireProxiedServerEnv(t)
+	bd := buildEmbeddedBD(t)
+
+	p := bdProxiedInit(t, bd, "umr")
+	issue := bdProxiedCreate(t, bd, p.dir, "Concurrent metadata target")
+	bdProxiedUpdateOne(t, bd, p.dir, issue.ID, "--metadata", `{"seed":"yes"}`)
+
+	const writers = 4
+	const rounds = 3
+	type result struct {
+		key      string
+		exitErr  error
+		combined string
+	}
+
+	var results []result
+	for round := 0; round < rounds; round++ {
+		roundResults := make([]result, writers)
+		var wg sync.WaitGroup
+		for i := 0; i < writers; i++ {
+			i := i
+			key := fmt.Sprintf("w%dr%d", i, round)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				stdout, stderr, err := bdProxiedUpdateRaw(t, bd, p.dir,
+					issue.ID, "--set-metadata", key+"=1")
+				roundResults[i] = result{key: key, exitErr: err, combined: stdout + stderr}
+			}()
+		}
+		wg.Wait()
+		results = append(results, roundResults...)
+	}
+
+	final := bdProxiedShow(t, bd, p.dir, issue.ID)
+	got := map[string]any{}
+	if len(final.Metadata) > 0 {
+		if err := json.Unmarshal(final.Metadata, &got); err != nil {
+			t.Fatalf("parse final metadata %q: %v", final.Metadata, err)
+		}
+	}
+
+	if got["seed"] != "yes" {
+		t.Errorf("seed metadata key erased by concurrent --set-metadata writers: %v", got)
+	}
+	var lost []string
+	for _, r := range results {
+		if r.exitErr == nil {
+			if _, ok := got[r.key]; !ok {
+				lost = append(lost, r.key)
+			}
+			if strings.Contains(r.combined, "retries exhausted") {
+				t.Errorf("writer %s exited 0 but reported exhausted retries:\n%s", r.key, r.combined)
+			}
+			continue
+		}
+		// A loud loss is acceptable; a silent one is the defect.
+		isConflictFailure := strings.Contains(r.combined, "retries exhausted") ||
+			strings.Contains(r.combined, "serialization failure") ||
+			strings.Contains(r.combined, "Error 1213")
+		if !isConflictFailure {
+			t.Errorf("writer %s failed for an unexpected reason: err=%v\n%s", r.key, r.exitErr, r.combined)
+		}
+	}
+	if len(lost) > 0 {
+		t.Fatalf("silent lost update: %d exit-0 --set-metadata writes missing from final metadata: %v (got %v)",
+			len(lost), lost, got)
+	}
+}
+
+// TestProxiedServerUpdateConcurrentAppendNotes covers the notes flavor of the
+// same defect: concurrent `bd update --append-notes` writers on one issue.
+// Every line whose writer exited 0 must appear in the final notes.
+func TestProxiedServerUpdateConcurrentAppendNotes(t *testing.T) {
+	requireProxiedServerEnv(t)
+	bd := buildEmbeddedBD(t)
+
+	p := bdProxiedInit(t, bd, "unr")
+	issue := bdProxiedCreate(t, bd, p.dir, "Concurrent notes target", "--notes", "seed line")
+
+	const writers = 4
+	type result struct {
+		line     string
+		exitErr  error
+		combined string
+	}
+	results := make([]result, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		i := i
+		line := fmt.Sprintf("appended by writer %d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stdout, stderr, err := bdProxiedUpdateRaw(t, bd, p.dir,
+				issue.ID, "--append-notes", line)
+			results[i] = result{line: line, exitErr: err, combined: stdout + stderr}
+		}()
+	}
+	wg.Wait()
+
+	final := bdProxiedShow(t, bd, p.dir, issue.ID)
+	if !strings.Contains(final.Notes, "seed line") {
+		t.Errorf("seed notes erased by concurrent --append-notes writers: %q", final.Notes)
+	}
+	for _, r := range results {
+		if r.exitErr != nil {
+			isConflictFailure := strings.Contains(r.combined, "retries exhausted") ||
+				strings.Contains(r.combined, "serialization failure") ||
+				strings.Contains(r.combined, "Error 1213")
+			if !isConflictFailure {
+				t.Errorf("writer failed for an unexpected reason: err=%v\n%s", r.exitErr, r.combined)
+			}
+			continue
+		}
+		if !strings.Contains(final.Notes, r.line) {
+			t.Errorf("silent lost update: exit-0 append %q missing from final notes %q", r.line, final.Notes)
+		}
 	}
 }
 
