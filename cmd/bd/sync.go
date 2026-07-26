@@ -2,16 +2,23 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/atomicfile"
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 )
 
@@ -25,10 +32,16 @@ import (
 //	0  synced (or nothing to do)
 //	1  error (transport, auth, storage — the usual bd failure code)
 //	2  merge conflict; the sync halted and nothing was pushed. NOT auto-resolved.
-//	3  push-race retries exhausted; transient, retry on the next tick.
+//	3  retries exhausted on a transient, self-healing condition (another replica
+//	   kept winning the push race, or a concurrent writer kept the working set
+//	   dirty); retry on the next tick.
+//	4  the dirty working set blocking the is_blocked repair is NOT transient: the
+//	   same pending graph edits have blocked every tick for a while and nothing
+//	   is advancing. Retrying will never publish; an operator must resolve it.
 const (
 	ExitSyncConflict         = 2
 	ExitSyncRetriesExhausted = 3
+	ExitSyncDirtyStuck       = 4
 )
 
 // defaultSyncAttempts bounds the pull->push cycle. Three is the production
@@ -41,8 +54,15 @@ const (
 	syncStatusOK               = "ok"
 	syncStatusConflict         = "conflict"
 	syncStatusRetriesExhausted = "retries-exhausted"
+	syncStatusDirtyStuck       = "dirty-stuck"
 	syncStatusDisabled         = "disabled"
 	syncStatusNoRemote         = "no-remote"
+)
+
+// Kinds of per-attempt transient failure recorded in syncOutcome.Transients.
+const (
+	syncTransientPushRace   = "push-race"
+	syncTransientDirtyGraph = "dirty-graph"
 )
 
 // syncOutcome is one run of the sync loop.
@@ -68,6 +88,48 @@ type syncOutcome struct {
 	Pushed        bool   `json:"pushed"`
 	PushSkipped   bool   `json:"push_skipped,omitempty"`
 	LastPushError string `json:"last_push_error,omitempty"`
+	// LastRecomputeError records a retryable is_blocked-repair failure (the
+	// working set was dirty). At most one of LastPushError and
+	// LastRecomputeError is set at a time: each retry clears the other, so on
+	// an exhausted run the one that survives names what the FINAL attempt
+	// actually failed on.
+	LastRecomputeError string `json:"last_recompute_error,omitempty"`
+	// Transients is every transient failure this run hit, in attempt order.
+	// LastPushError/LastRecomputeError answer "what did the FINAL attempt fail
+	// on" — deliberately, since that is what the operator's next step depends
+	// on — and because each retry clears the other they cannot answer "what did
+	// this run actually fight". A run that lost a push race and then hit a
+	// dirty working set reports only the second in those two fields; both are
+	// here (wy-wub2s, from the wy-mlnz2 review's F7/F8).
+	Transients []syncTransient `json:"transients,omitempty"`
+	// DirtyGraphFingerprint identifies the pending graph edits that blocked the
+	// is_blocked repair, when every blocked attempt in this run saw the SAME
+	// ones. Empty means either no attempt was blocked, or the working set was
+	// visibly moving between attempts, or the evidence was unavailable — in all
+	// of which cases there is nothing to compare across ticks. It is an opaque
+	// token: compare for equality, never parse.
+	DirtyGraphFingerprint string `json:"dirty_graph_fingerprint,omitempty"`
+	// DirtyGraphStuckTicks counts consecutive sync runs, including this one,
+	// that exhausted their budget against this same fingerprint. Set by the
+	// caller from the persisted marker, not by the loop.
+	DirtyGraphStuckTicks int `json:"dirty_graph_stuck_ticks,omitempty"`
+}
+
+// syncTransient is one attempt's transient failure.
+type syncTransient struct {
+	Attempt int    `json:"attempt"`
+	Kind    string `json:"kind"`
+	Error   string `json:"error,omitempty"`
+}
+
+// sawTransient reports whether any attempt failed with kind.
+func (o *syncOutcome) sawTransient(kind string) bool {
+	for _, t := range o.Transients {
+		if t.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // syncOps is the store surface the loop drives, injected as functions so the
@@ -83,6 +145,12 @@ type syncOps struct {
 	recompute func(context.Context) (int, error)
 	// push publishes local commits to the remote.
 	push func(context.Context) error
+	// dirtyFingerprint identifies the pending graph edits currently blocking
+	// the is_blocked repair (issueops.DirtyGraphFingerprint semantics: "" means
+	// clean, an error means the evidence is unavailable). May be nil, which the
+	// loop treats exactly like unavailable evidence — it never escalates on a
+	// question it could not ask.
+	dirtyFingerprint func(context.Context) (string, error)
 	// progress reports a step to the operator; may be nil.
 	progress func(format string, args ...interface{})
 }
@@ -151,6 +219,7 @@ func runSyncLoop(ctx context.Context, ops syncOps, maxAttempts int) (*syncOutcom
 		maxAttempts = 1
 	}
 	out := &syncOutcome{Status: syncStatusOK}
+	var evidence dirtyEvidence
 
 	// Pre-flight. A previous halted sync leaves its conflicts live, and Dolt
 	// refuses to merge over them — without this check that shows up as an
@@ -208,8 +277,47 @@ func runSyncLoop(ctx context.Context, ops syncOps, maxAttempts int) (*syncOutcom
 		ops.report("recompute-blocked")
 		corrected, err := ops.recompute(ctx)
 		if err != nil {
-			return out, fmt.Errorf("recompute-blocked: %w", err)
+			if !isRecomputeDirtyGraphErr(err) {
+				return out, fmt.Errorf("recompute-blocked: %w", err)
+			}
+			// Not our failure and not a durable one: someone else's
+			// uncommitted edit to issues/dependencies landed between our pull
+			// and our repair. Treat it exactly like a push race — re-enter the
+			// attempt loop, and if the budget runs out report the transient
+			// exit so the next tick tries again. Classifying it as a hard
+			// error instead left local commits unpublished until a tick
+			// happened to catch a clean working set, which on a shared
+			// sql-server topology is luck (wy-mlnz2).
+			//
+			// Two things about the retry are worth knowing before touching it.
+			// It is paced by the pull's round trip, not by a sleep — the loop
+			// has none. And the retry does not merely WAIT for the other
+			// writer: the pull's own pre-merge auto-commit (GH#2474) stages and
+			// commits whatever is dirty, so it is often what clears the guard,
+			// committing that writer's already-SQL-committed rows under this
+			// sync's author. That is pre-existing behavior on attempt 1 of
+			// every tick and is data-safe, but a retry repeats the exposure —
+			// so this must stay bounded, and must never become a wait loop.
+			out.LastRecomputeError = err.Error()
+			out.LastPushError = ""
+			out.Transients = append(out.Transients, syncTransient{
+				Attempt: attempt, Kind: syncTransientDirtyGraph, Error: err.Error(),
+			})
+			// Evidence for the STUCK-vs-BUSY question the retry alone cannot
+			// answer. Sampled per blocked attempt and folded down at the end:
+			// see dirtyEvidence.fold. Sampling failures are recorded, not
+			// returned — a run whose evidence is unavailable still retries and
+			// still reports the transient exit, exactly as before.
+			evidence.observe(ops.sample(ctx))
+			ops.report("recompute-blocked: working set dirty (concurrent writer) — re-pulling and retrying")
+			continue
 		}
+		out.LastRecomputeError = ""
+		// The repair ran, so whatever was dirty cleared: this run has SEEN the
+		// working set advance, and any earlier blocked attempt was transient by
+		// demonstration. Dropping the samples is what keeps a later push-race
+		// exhaustion from inheriting stuck-looking evidence.
+		evidence = dirtyEvidence{}
 		out.RowsCorrected += corrected
 
 		// From here on this run has completed a pull and an is_blocked repair,
@@ -233,11 +341,61 @@ func runSyncLoop(ctx context.Context, ops syncOps, maxAttempts int) (*syncOutcom
 		// that is not a fast-forward race cannot converge by retrying and was
 		// returned above.
 		out.LastPushError = pushErr.Error()
+		out.Transients = append(out.Transients, syncTransient{
+			Attempt: attempt, Kind: syncTransientPushRace, Error: pushErr.Error(),
+		})
 		ops.report("push race (non-fast-forward) — re-pulling and retrying")
 	}
 
 	out.Status = syncStatusRetriesExhausted
+	out.DirtyGraphFingerprint = evidence.fold()
 	return out, nil
+}
+
+// dirtyEvidence accumulates one fingerprint per blocked attempt.
+type dirtyEvidence struct {
+	samples []string
+	// unavailable records that at least one sample could not be taken, which
+	// disqualifies the whole run: a fold over the attempts we happened to see
+	// would claim "nothing changed" about attempts we never looked at.
+	unavailable bool
+}
+
+func (e *dirtyEvidence) observe(fingerprint string, err error) {
+	if err != nil || fingerprint == "" {
+		// An error means the evidence is unavailable. So does "" here, which
+		// says the graph tables were CLEAN by the time we looked — the guard
+		// fired and then the other writer committed, i.e. exactly the transient
+		// case, and a value that is not a fingerprint must never be compared as
+		// one.
+		e.unavailable = true
+		return
+	}
+	e.samples = append(e.samples, fingerprint)
+}
+
+// fold returns the fingerprint common to every blocked attempt, or "" when the
+// run proves nothing: no samples, an unavailable one, or a working set that
+// visibly moved between attempts (a busy fleet, which must never escalate).
+func (e *dirtyEvidence) fold() string {
+	if e.unavailable || len(e.samples) == 0 {
+		return ""
+	}
+	for _, s := range e.samples[1:] {
+		if s != e.samples[0] {
+			return ""
+		}
+	}
+	return e.samples[0]
+}
+
+// sample reads the current dirty-graph fingerprint, treating an absent hook as
+// unavailable evidence.
+func (o syncOps) sample(ctx context.Context) (string, error) {
+	if o.dirtyFingerprint == nil {
+		return "", errors.New("dirty-graph evidence not available")
+	}
+	return o.dirtyFingerprint(ctx)
 }
 
 // pushRacePattern matches the ways a push fails because the remote moved. Kept
@@ -275,6 +433,26 @@ func isPushRaceErr(err error) bool {
 		return false
 	}
 	return pushRacePattern.MatchString(err.Error())
+}
+
+// isRecomputeDirtyGraphErr reports whether the is_blocked repair refused to run
+// because the graph tables (issues, dependencies) had uncommitted working-set
+// changes — the one recompute failure that retrying can fix.
+//
+// This is classified from the typed sentinel, never from the message. The guard
+// is a foreign package's error text; matching on it would let a reworded guard
+// silently demote this back to a hard error, which is exactly the failure being
+// fixed (wy-mlnz2).
+//
+// Why it is retryable at all: on a shared sql-server topology every agent
+// shares one working set, so an uncommitted write from ANOTHER agent — no part
+// of this sync, and gone as soon as they commit — is what trips the guard. The
+// condition is transient, foreign, and self-healing, so the loop's existing
+// retry budget is the right response. It is still never *ignored*: the repair
+// is not optional (see runSyncLoop), so an exhausted budget halts before the
+// push rather than publishing a stale is_blocked.
+func isRecomputeDirtyGraphErr(err error) bool {
+	return err != nil && errors.Is(err, issueops.ErrBlockedRecomputeDirtyGraph)
 }
 
 // bareNoRemotePattern matches Dolt's bare "no remote" wording. `bd dolt push`
@@ -381,6 +559,14 @@ shell:
   4. push, retrying a bounded number of times when another replica wins the
      push race
 
+The repair in step 3 refuses to run while another writer has uncommitted changes
+to issues/dependencies. That is transient and not this sync's doing, so it is
+retried on the same budget as a push race rather than failing the run. A working
+set that is NOT transient — the same pending graph edits blocking every attempt
+of several consecutive runs, which is what constraint violations or an abandoned
+uncommitted edit look like — exits 4 instead, because no amount of retrying will
+ever publish and only an operator can clear it.
+
 Conflicts sync cannot resolve safely are NEVER auto-resolved: it halts before
 recomputing or pushing and exits 2, and repeated runs keep halting the same way
 until an operator resolves the divergence. (The pull underneath does auto-settle
@@ -394,7 +580,11 @@ Exit codes (a sync timer can branch on these without parsing output):
   0  synced, or nothing to do
   1  error (transport, auth, storage)
   2  merge conflict — halted, nothing pushed, resolve it by hand
-  3  push-race retries exhausted — transient, retry on the next tick
+  3  retries exhausted (push race, or a concurrent writer's dirty working set)
+     — transient, nothing pushed, retry on the next tick
+  4  the dirty working set is stuck, not busy: identical pending graph edits
+     blocked every attempt of several consecutive runs — nothing pushed, and no
+     later tick will publish until an operator clears it
 
 This is not 'bd federation sync', which syncs with named peer towns and takes a
 --strategy ours|theirs to resolve whatever conflicts it meets. 'bd sync' targets
@@ -412,7 +602,7 @@ Examples:
 
 func init() {
 	syncCmd.Flags().String("remote", "", "Sync with a specific named remote instead of the default")
-	syncCmd.Flags().Int("attempts", defaultSyncAttempts, "Maximum pull/push attempts before reporting a push race (exit 3)")
+	syncCmd.Flags().Int("attempts", defaultSyncAttempts, "Maximum pull/push attempts before reporting a transient retry exhaustion (exit 3)")
 	rootCmd.AddCommand(syncCmd)
 }
 
@@ -478,6 +668,10 @@ func runSyncCommand(cmd *cobra.Command, _ []string) error {
 		recompute: func(ctx context.Context) (int, error) {
 			return recomputer.RecomputeAllBlocked(ctx)
 		},
+		// Evidence for the stuck-vs-busy question, read straight from the
+		// working set rather than parsed out of the guard's message. Absent
+		// raw-SQL access the hook stays nil and the loop simply never escalates.
+		dirtyFingerprint: dirtyGraphFingerprintOp(st),
 		push: func(ctx context.Context) error {
 			if noPush {
 				return nil
@@ -520,6 +714,10 @@ func runSyncCommand(cmd *cobra.Command, _ []string) error {
 		return exitErr
 	}
 
+	// Cross-tick half of the stuck detector, before any reporting so the output
+	// and the exit code agree on what this run was.
+	applyDirtyProgress(out, time.Now())
+
 	if jsonOutput {
 		if jerr := outputJSON(out); jerr != nil {
 			return HandleError("%v", jerr)
@@ -533,8 +731,27 @@ func runSyncCommand(cmd *cobra.Command, _ []string) error {
 		return &exitError{Code: ExitSyncConflict}
 	case syncStatusRetriesExhausted:
 		return &exitError{Code: ExitSyncRetriesExhausted}
+	case syncStatusDirtyStuck:
+		return &exitError{Code: ExitSyncDirtyStuck}
 	default:
 		return nil
+	}
+}
+
+// dirtyGraphFingerprintOp builds the loop's dirty-graph evidence hook, or nil
+// when this store cannot answer the question — an unimplemented interface must
+// leave the detector silent, never guessing.
+func dirtyGraphFingerprintOp(st storage.DoltStorage) func(context.Context) (string, error) {
+	accessor, ok := storage.UnwrapStore(st).(storage.RawDBAccessor)
+	if !ok {
+		return nil
+	}
+	db := accessor.DB()
+	if db == nil {
+		return nil
+	}
+	return func(ctx context.Context) (string, error) {
+		return issueops.DirtyGraphFingerprint(ctx, db)
 	}
 }
 
@@ -600,7 +817,202 @@ func syncConflictMessage(out *syncOutcome) []string {
 			"losing the push race; the retry is what conflicted. That earlier work remains in the",
 			"local database and has NOT been published.")
 	}
+	// A dirty-working-set retry pulls without ever completing its repair, so it
+	// leaves out.Pulled false while still having moved local history. Without
+	// this the operator is told the run touched nothing, and goes looking in the
+	// wrong place for the commits that pull merged.
+	if out.LastRecomputeError != "" {
+		lines = append(lines,
+			"Note: an earlier attempt in this run completed its pull but its is_blocked repair was",
+			"blocked by a dirty working set, so it retried. Anything that pull merged is in the local",
+			"database, is NOT repaired, and has NOT been published.")
+	}
 	return lines
+}
+
+// syncRetriesExhaustedMessage renders the operator-facing report for exit 3.
+// Two different transient conditions land here and they need different next
+// steps: a push race is between REPLICAS and resolves by retrying or raising
+// --attempts, while a dirty working set is another writer on THIS replica and
+// resolves when they commit. Telling an operator "another replica kept winning
+// the race" when the real blocker is an uncommitted local edit sends them to
+// the wrong machine. A pure function of the outcome, for the same reason
+// syncConflictMessage is.
+func syncRetriesExhaustedMessage(out *syncOutcome) []string {
+	if out.LastRecomputeError != "" {
+		lines := []string{
+			fmt.Sprintf("Error: is_blocked repair kept finding a dirty working set after %d attempt(s).", out.Attempts),
+			fmt.Sprintf("  last recompute error: %s", out.LastRecomputeError),
+			"Another writer has uncommitted changes to issues/dependencies on this replica, and the",
+			"repair refuses to derive is_blocked from a graph it cannot commit. Nothing was pushed.",
+			"This is transient — retry on the next tick, or commit/discard the pending changes.",
+			"If it is NOT transient (a table left dirty by constraint violations never clears), the",
+			"next few runs will see the identical pending edits and escalate to exit 4 rather than",
+			"reporting this forever.",
+		}
+		return append(lines, syncMixedTransientNote(out)...)
+	}
+	lines := []string{fmt.Sprintf("Error: push-race retries exhausted after %d attempt(s).", out.Attempts)}
+	if out.LastPushError != "" {
+		lines = append(lines, fmt.Sprintf("  last push error: %s", out.LastPushError))
+	}
+	lines = append(lines,
+		"This is transient — another replica kept winning the race. Retry on the next tick, or raise --attempts.")
+	return append(lines, syncMixedTransientNote(out)...)
+}
+
+// syncMixedTransientNote reports the transient conditions this run fought that
+// the headline does not name. The headline is about the FINAL attempt, which is
+// the right thing to act on; without this an operator reading "push-race
+// retries exhausted" has no way to know a dirty working set also ate an attempt
+// of the budget, and would raise --attempts when the real story is contention
+// on two different axes (wy-wub2s).
+func syncMixedTransientNote(out *syncOutcome) []string {
+	if !out.sawTransient(syncTransientPushRace) || !out.sawTransient(syncTransientDirtyGraph) {
+		return nil
+	}
+	return []string{
+		"Note: this run hit BOTH transient conditions — a lost push race and a dirty working set.",
+		"The report above names what the final attempt failed on; --json lists every attempt under",
+		"\"transients\".",
+	}
+}
+
+// syncStuckMessage renders the operator-facing report for exit 4: the dirty
+// working set is not going to clear on its own.
+//
+// This is the escalation exit 3 cannot make. A permanently-dirty graph table —
+// constraint violations no writer will ever commit, an abandoned uncommitted
+// edit — reports the same "transient, retry on the next tick" forever, so no
+// tick ever publishes and nothing in the output ever changes to say so
+// (wy-wub2s). The claim being made here is narrow and evidence-backed: the
+// pending graph edits have been byte-identical across every attempt of the last
+// N runs, so this is a stuck table rather than a busy fleet.
+func syncStuckMessage(out *syncOutcome) []string {
+	lines := []string{
+		fmt.Sprintf("Error: the is_blocked repair has been blocked by the SAME pending graph edits for %d consecutive sync run(s).", out.DirtyGraphStuckTicks),
+	}
+	if out.LastRecomputeError != "" {
+		lines = append(lines, fmt.Sprintf("  last recompute error: %s", out.LastRecomputeError))
+	}
+	lines = append(lines,
+		"Nothing is advancing: every attempt saw an identical set of uncommitted changes to",
+		"issues/dependencies, so this is not a concurrent writer that is about to commit. Retrying",
+		"cannot publish — the repair refuses to derive is_blocked from a graph it cannot commit, so",
+		"local commits stay unpublished until an operator clears the working set.",
+		"Resolve it by hand, then the next tick syncs normally:",
+		"  bd vc status                 # what is dirty",
+		"  bd conflicts list            # constraint violations / conflicts holding it dirty",
+		"  bd vc commit -m '...'        # commit the pending changes, if they are wanted",
+		"Nothing was pushed. This exit is deliberately distinct from exit 3 so a sync timer can page",
+		"instead of retrying forever.")
+	return append(lines, syncMixedTransientNote(out)...)
+}
+
+// syncStuckTicks is how many consecutive exhausted runs against byte-identical
+// pending graph edits it takes before sync calls the working set stuck rather
+// than busy.
+//
+// It is deliberately more than one. A single run's attempts are paced by one
+// pull round trip each, so a fleet writing in bursts really can show the same
+// fingerprint for the whole budget; requiring the evidence to survive several
+// runs — minutes apart on a timer — is what keeps a busy shared server from
+// being escalated as a stuck one. Every intervening run that publishes, or that
+// sees any different pending edits, resets the count to zero.
+const syncStuckTicks = 3
+
+// syncStateFile holds the cross-tick half of the stuck detector, beside the
+// auto-export state. It is local scratch, never version-controlled: writing this
+// evidence into the database would add to the very dirty working set it is
+// evidence about.
+const syncStateFile = "sync-state.json"
+
+// syncState is what one sync run leaves behind for the next one.
+type syncState struct {
+	// DirtyGraphFingerprint is the opaque token from the last exhausted run.
+	DirtyGraphFingerprint string `json:"dirty_graph_fingerprint,omitempty"`
+	// StuckTicks counts consecutive exhausted runs that saw it.
+	StuckTicks int       `json:"stuck_ticks,omitempty"`
+	FirstSeen  time.Time `json:"first_seen,omitempty"`
+}
+
+// classifyDirtyProgress folds this run's evidence into the persisted marker and
+// reports the marker the next run should see, plus whether this run escalates.
+//
+// Pure, so the escalation rule is testable without a clock, a filesystem, or a
+// Dolt server. Any outcome that is not an exhausted-on-dirty run clears the
+// marker: a run that published, conflicted, or exhausted on a push race is
+// evidence that this replica is not wedged on pending graph edits.
+func classifyDirtyProgress(out *syncOutcome, prev *syncState, now time.Time) (*syncState, bool) {
+	// LastRecomputeError, not just any dirty transient: the marker is about the
+	// condition that is still blocking us as the run ends.
+	blocked := out.Status == syncStatusRetriesExhausted &&
+		out.LastRecomputeError != "" &&
+		out.DirtyGraphFingerprint != ""
+	if !blocked {
+		return &syncState{}, false
+	}
+	next := &syncState{DirtyGraphFingerprint: out.DirtyGraphFingerprint, StuckTicks: 1, FirstSeen: now}
+	if prev != nil && prev.DirtyGraphFingerprint == out.DirtyGraphFingerprint {
+		next.StuckTicks = prev.StuckTicks + 1
+		if !prev.FirstSeen.IsZero() {
+			next.FirstSeen = prev.FirstSeen
+		}
+	}
+	return next, next.StuckTicks >= syncStuckTicks
+}
+
+// applyDirtyProgress runs the cross-tick half of the detector: load the marker,
+// classify, persist, and promote the outcome to the stuck status when the
+// evidence has survived long enough.
+//
+// Failure to read or write the marker is not fatal and not reported: the detector
+// is an escalation on top of a working retry, so a rig with no .beads directory
+// (or an unwritable one) keeps the pre-existing exit-3 behavior instead of losing
+// the sync.
+func applyDirtyProgress(out *syncOutcome, now time.Time) {
+	beadsDir := beads.FindBeadsDir()
+	if beadsDir == "" {
+		return
+	}
+	next, stuck := classifyDirtyProgress(out, loadSyncState(beadsDir), now)
+	saveSyncState(beadsDir, next)
+	out.DirtyGraphStuckTicks = next.StuckTicks
+	if stuck {
+		out.Status = syncStatusDirtyStuck
+	}
+}
+
+func loadSyncState(beadsDir string) *syncState {
+	data, err := os.ReadFile(filepath.Join(beadsDir, syncStateFile)) //nolint:gosec // path is the resolved .beads dir
+	if err != nil {
+		return &syncState{}
+	}
+	var state syncState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return &syncState{}
+	}
+	return &state
+}
+
+func saveSyncState(beadsDir string, state *syncState) {
+	path := filepath.Join(beadsDir, syncStateFile)
+	if state == nil || state.DirtyGraphFingerprint == "" {
+		// Nothing to remember. Remove rather than write an empty marker so a
+		// healthy rig does not carry stale scratch around.
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			debug.Logf("sync: failed to clear %s: %v\n", path, err)
+		}
+		return
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		debug.Logf("sync: failed to marshal sync state: %v\n", err)
+		return
+	}
+	if err := atomicfile.WriteFile(path, data, 0o600); err != nil {
+		debug.Logf("sync: failed to save sync state: %v\n", err)
+	}
 }
 
 func printSyncOutcome(out *syncOutcome, noPush bool) {
@@ -610,11 +1022,13 @@ func printSyncOutcome(out *syncOutcome, noPush bool) {
 			fmt.Fprintln(os.Stderr, line)
 		}
 	case syncStatusRetriesExhausted:
-		fmt.Fprintf(os.Stderr, "Error: push-race retries exhausted after %d attempt(s).\n", out.Attempts)
-		if out.LastPushError != "" {
-			fmt.Fprintf(os.Stderr, "  last push error: %s\n", out.LastPushError)
+		for _, line := range syncRetriesExhaustedMessage(out) {
+			fmt.Fprintln(os.Stderr, line)
 		}
-		fmt.Fprintln(os.Stderr, "This is transient — another replica kept winning the race. Retry on the next tick, or raise --attempts.")
+	case syncStatusDirtyStuck:
+		for _, line := range syncStuckMessage(out) {
+			fmt.Fprintln(os.Stderr, line)
+		}
 	default:
 		if out.RowsCorrected > 0 {
 			fmt.Printf("Recomputed is_blocked: %d row(s) corrected.\n", out.RowsCorrected)
