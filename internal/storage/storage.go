@@ -89,6 +89,17 @@ type Storage interface {
 	// issueops.Lifecycle.
 	IssueLifecycle() (issueops.Lifecycle, error)
 
+	// IssueReader returns the guarded issue-query surface for this store: the
+	// read counterpart of IssueLifecycle, and its own role rather than four
+	// more methods on that one. Like the lifecycle accessor, every decorator
+	// in a store's chain answers for itself, so the returned Reader carries the
+	// same layers the store itself carries.
+	//
+	// Reads fire no hooks, so the hook decorator's answer is its inner store's
+	// unchanged. The accessor exists on it anyway: a seam a caller has to
+	// reason about decorator-by-decorator is not a seam.
+	IssueReader() (issueops.Reader, error)
+
 	// Issue CRUD
 	CreateIssue(ctx context.Context, issue *types.Issue, actor string) error
 	CreateIssues(ctx context.Context, issues []*types.Issue, actor string) error
@@ -489,6 +500,16 @@ type LifecycleManager interface {
 // Used by auto-commit and auto-push flows.
 type PendingCommitter interface {
 	CommitPending(ctx context.Context, actor string) (bool, error)
+}
+
+// PendingChangeDetector reports whether the working set holds changes a
+// commit would capture. Unlike VersionControl.Status, this excludes
+// dolt_ignore'd tables (wisp and lease tables appear in dolt_status but
+// cannot be staged), so it answers "would CommitPending mint a commit?"
+// without committing. Callers that must refuse to act on a dirty working
+// set (bd dolt remote reset-data) should type-assert to this interface.
+type PendingChangeDetector interface {
+	HasCommittablePending(ctx context.Context) (bool, error)
 }
 
 // BackupStore provides Dolt backup operations (CALL DOLT_BACKUP) for

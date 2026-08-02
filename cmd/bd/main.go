@@ -36,6 +36,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/backends"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	dbidentifier "github.com/steveyegge/beads/internal/storage/domain/db"
+	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/telemetry"
@@ -176,6 +177,22 @@ func isReadOnlyCommand(cmdName string) bool {
 	return readOnlyCommands[cmdName]
 }
 
+// isPreviewCommand reports whether cmd was explicitly invoked in a
+// non-mutating preview mode. Preview flags are command-local rather than
+// persistent, so checking them here after Cobra has parsed the selected
+// command is the earliest reliable point to keep the store open read-only.
+func isPreviewCommand(cmd *cobra.Command) bool {
+	for _, name := range []string{"dry-run", "inspect"} {
+		if flag := cmd.Flags().Lookup(name); flag != nil {
+			enabled, err := cmd.Flags().GetBool(name)
+			if err == nil && enabled {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type rootStorePolicy struct {
 	readOnly         bool
 	disableAutoStart bool
@@ -198,6 +215,66 @@ func effectiveRootStorePolicy(cmdName string, strictReadonly bool) rootStorePoli
 // rejected earlier by validateConfiguredBackend; proxied Dolt remains writable-only.
 func backendSupportsStrictReadonly(cfg *configfile.Config) bool {
 	return cfg == nil || !cfg.IsDoltProxiedServerMode()
+}
+
+// runsPostCommandMaintenance reports whether PersistentPostRunE should run the
+// post-command maintenance net — Dolt auto-commit, the tip-metadata commit,
+// auto-backup, auto-export and auto-push.
+//
+// `bd serve` is excluded, and not as an optimization. Those steps are per-
+// COMMAND bookkeeping, and a server is not a command: it is a process that ran
+// for hours and committed each mutation inside its own transaction as it
+// happened. Running them when the operator finally sends SIGTERM would push and
+// export on the way out of a signal handler — the worst possible moment — and
+// attribute a whole process lifetime of requests to the shutdown. Proxied-mode
+// serve never reached this branch at all (PersistentPostRunE only closes the
+// provider there); server and shared-server mode do, so the exclusion has to be
+// stated rather than inherited.
+func runsPostCommandMaintenance(cmdName string, strictReadonly bool) bool {
+	if cmdName == serveCmdName {
+		return false
+	}
+	return effectiveRootStorePolicy(cmdName, strictReadonly).runMaintenance
+}
+
+// resolveDoltServerConnection fills in how to reach the workspace's Dolt SQL
+// server — host, port, socket, user, password, TLS — on doltCfg.
+//
+// Both consumers of a SQL server in this process go through here: the CLI's own
+// store open, and the unit-of-work provider `bd serve` builds for a server-mode
+// workspace. That matters more than the deduplication: an HTTP request and a
+// CLI command in the same workspace must reach the same server as the same
+// identity, and the only way to guarantee that is to resolve it once.
+//
+// It mirrors dolt.applyResolvedConfig, which this hand-built doltCfg path
+// bypasses.
+func resolveDoltServerConnection(ctx context.Context, beadsDir string, fileCfg *configfile.Config, doltCfg *dolt.Config) error {
+	doltCfg.ServerHost = fileCfg.GetDoltServerHost()
+	// Use doltserver.DefaultConfig for port resolution (env > port file >
+	// config.yaml). Port 0 is fine here — auto-start will resolve it.
+	doltCfg.ServerPort = doltserver.DefaultConfig(beadsDir).Port
+	doltCfg.ServerSocket = fileCfg.GetDoltServerSocket()
+	// A configured credential command targets an authenticating gateway server:
+	// run it for a short-lived token used as the connection username. Fail closed
+	// — never fall back to the static/root user when a command was configured but
+	// failed. Server mode only: embedded stores never present a username, so the
+	// command must not run (or fail) embedded opens even when the env var is set.
+	// Dolt-only: the gateway credential command mints a Dolt server
+	// username. IsSharedServerMode() forces ServerMode true with no backend
+	// guard, so non-Dolt metadata must not try to resolve a server username.
+	if doltCfg.ServerMode && fileCfg.GetBackend() == configfile.BackendDolt {
+		if _, err := dolt.ApplyGatewayCredential(ctx, fileCfg, doltCfg); err != nil {
+			return fmt.Errorf("resolving dolt credential command: %w", err)
+		}
+	}
+	if doltCfg.ServerUser == "" {
+		doltCfg.ServerUser = fileCfg.GetDoltServerUser()
+	}
+	// Use the resolved port for credential lookup — metadata.json port
+	// and runtime port can diverge (e.g., tunnel on 3308 vs local on 3307).
+	doltCfg.ServerPassword = fileCfg.GetDoltServerPasswordForPort(doltCfg.ServerPort)
+	doltCfg.ServerTLS = fileCfg.GetDoltServerTLS()
+	return nil
 }
 
 var (
@@ -1234,18 +1311,29 @@ var rootCmd = &cobra.Command{
 			commandSpan.SetAttributes(attribute.String("bd.actor", actor))
 		}
 
+		// Check if this is a read-only command (GH#804) or an explicitly
+		// non-mutating preview. Both must open the store read-only: otherwise
+		// schema initialization runs before the command's RunE can honor
+		// --dry-run/--inspect or reject invalid arguments. Resolved here,
+		// ahead of version tracking, because that is the first step a preview
+		// has to change.
+		previewMode := isPreviewCommand(cmd)
 		policy := effectiveRootStorePolicy(cmd.Name(), readonlyMode)
+		useReadOnly := policy.readOnly || previewMode
 
 		// Track bd version changes unless strict readonly forbids repository mutation.
 		// Best-effort tracking - failures are silent.
+		//
+		// A preview detects the change but must not consume it: .local_version
+		// is the one-shot signal autoMigrateOnVersionBump reads, and a preview
+		// skips that reconciliation (see below). See trackBdVersionPreview.
 		if policy.runMaintenance {
-			trackBdVersion()
+			if previewMode {
+				trackBdVersionPreview()
+			} else {
+				trackBdVersion()
+			}
 		}
-
-		// Check if this is a read-only command (GH#804)
-		// Read-only commands open the store in read-only mode to avoid modifying
-		// the database (which breaks file watchers).
-		useReadOnly := policy.readOnly
 
 		// If the operator passed --force on `bd migrate` or `bd migrate schema`,
 		// set the programmatic gate override before both autoMigrateOnVersionBump
@@ -1262,12 +1350,17 @@ var rootCmd = &cobra.Command{
 		schema.SetForceAllowRemoteMigrate(forcedMigrate)
 
 		// Auto-migrate database on version bump (bd-jgxi).
-		// Runs for ALL commands (including read-only ones) because the migration
-		// opens its own store connection, writes the version metadata, commits it,
-		// and closes BEFORE the main store is opened. This ensures bd doctor and
-		// read-only commands see the correct version after a CLI upgrade.
-
-		if policy.runMaintenance {
+		// Runs for ALL non-preview commands (including read-only ones) because
+		// the migration opens its own store connection, writes the version
+		// metadata, commits it, and closes BEFORE the main store is opened.
+		// This ensures bd doctor and read-only commands see the correct version
+		// after a CLI upgrade.
+		//
+		// Preview paths must never call this helper: it opens a separate
+		// writable store before the main read-only store and can therefore
+		// apply schema migrations before RunE validates arguments or renders a
+		// dry-run plan.
+		if policy.runMaintenance && !previewMode {
 			autoMigrateOnVersionBump(beadsDir)
 		}
 
@@ -1279,6 +1372,7 @@ var rootCmd = &cobra.Command{
 		doltPath := doltserver.ResolveDoltDir(beadsDir)
 		doltCfg := &dolt.Config{
 			ReadOnly:         useReadOnly,
+			Preview:          previewMode,
 			DisableAutoStart: policy.disableAutoStart,
 			BeadsDir:         beadsDir,
 			LenientOpen:      isWorkingSetReconcileCommand(cmd),
@@ -1320,32 +1414,9 @@ var rootCmd = &cobra.Command{
 				logConfigDiscovery(beadsDir, fmt.Sprintf("metadata loaded without dolt_database; using default database name %q", configfile.DefaultDoltDatabase))
 			}
 
-			doltCfg.ServerHost = cfg.GetDoltServerHost()
-			// Use doltserver.DefaultConfig for port resolution (env > port file >
-			// config.yaml). Port 0 is fine here — auto-start will resolve it.
-			doltCfg.ServerPort = doltserver.DefaultConfig(beadsDir).Port
-			doltCfg.ServerSocket = cfg.GetDoltServerSocket()
-			// A configured credential command targets an authenticating gateway server:
-			// run it for a short-lived token used as the connection username. Fail closed
-			// — never fall back to the static/root user when a command was configured but
-			// failed. Mirrors applyResolvedConfig, which this hand-built doltCfg path
-			// bypasses. Server mode only: embedded stores never present a username, so the
-			// command must not run (or fail) embedded opens even when the env var is set.
-			// Dolt-only: the gateway credential command mints a Dolt server
-			// username. IsSharedServerMode() forces ServerMode true with no backend
-			// guard, so non-Dolt metadata must not try to resolve a server username.
-			if doltCfg.ServerMode && cfg.GetBackend() == configfile.BackendDolt {
-				if _, credErr := dolt.ApplyGatewayCredential(rootCtx, cfg, doltCfg); credErr != nil {
-					return HandleError("resolving dolt credential command: %v", credErr)
-				}
+			if err := resolveDoltServerConnection(rootCtx, beadsDir, cfg, doltCfg); err != nil {
+				return HandleError("%v", err)
 			}
-			if doltCfg.ServerUser == "" {
-				doltCfg.ServerUser = cfg.GetDoltServerUser()
-			}
-			// Use the resolved port for credential lookup — metadata.json port
-			// and runtime port can diverge (e.g., tunnel on 3308 vs local on 3307).
-			doltCfg.ServerPassword = cfg.GetDoltServerPasswordForPort(doltCfg.ServerPort)
-			doltCfg.ServerTLS = cfg.GetDoltServerTLS()
 		} else if cfgErr == nil {
 			logConfigDiscovery(beadsDir, "config discovery")
 			// Load returned (nil, nil) — no config file found.
@@ -1409,14 +1480,23 @@ var rootCmd = &cobra.Command{
 
 		// In proxied mode the CLI short-circuits to the uowProvider path and
 		// dispatches through the *_proxied_server.go duals.
+		//
+		// Preview commands take the same policy here as they do on the
+		// embedded and server paths, and for the same reason: the provider
+		// open runs CREATE DATABASE and schema.MigrateUpWithLock, and
+		// reconcileVersionProxiedServer writes version metadata — all during
+		// root pre-run, before --dry-run/--inspect has had any effect. Proxied
+		// mode is where that is least visible, not where it is acceptable.
 		if proxiedServerMode {
-			p, err := newProxiedServerUOWProvider(rootCtx, beadsDir, databaseOverride)
+			p, err := newProxiedServerUOWProvider(rootCtx, beadsDir, databaseOverride, previewProviderOptions(previewMode)...)
 			if err != nil {
 				return HandleError("failed to open uow provider: %v", err)
 			}
 			uowProvider = p
 
-			reconcileVersionProxiedServer(rootCtx)
+			if !previewMode {
+				reconcileVersionProxiedServer(rootCtx)
+			}
 
 			syncCommandContext()
 			return nil
@@ -1600,7 +1680,7 @@ var rootCmd = &cobra.Command{
 				uowProvider = nil
 			}
 		} else {
-			if effectiveRootStorePolicy(cmd.Name(), readonlyMode).runMaintenance {
+			if runsPostCommandMaintenance(cmd.Name(), readonlyMode) {
 				// Dolt auto-commit: after a successful write command (and after final flush),
 				// create a Dolt commit so changes don't remain only in the working set.
 				if commandDidWrite.Load() && !commandDidExplicitDoltCommit {
@@ -1617,21 +1697,40 @@ var rootCmd = &cobra.Command{
 						return HandleError("dolt tip auto-commit failed: %v", err)
 					} else if mode == doltAutoCommitOn {
 						// Apply tip metadata writes now (deferred in recordTipShown for Dolt).
+						//
+						// A store that refuses writes by construction — the
+						// preview open, and strict --readonly — must not turn
+						// an otherwise successful command into a non-zero exit
+						// here. This block is deliberately not gated by the
+						// read-only classification, and that has been fine
+						// because OpenForReadOnlyCommand is "otherwise a normal
+						// writable store"; the write-refusing opens break that
+						// assumption. Tip bookkeeping is incidental and
+						// recordTipShown's own contract is that it may fail
+						// silently, so skip it and carry on.
+						tipWritesRefused := false
 						for tipID := range commandTipIDsShown {
 							key := fmt.Sprintf("tip_%s_last_shown", tipID)
 							value := time.Now().Format(time.RFC3339)
 							if err := store.SetLocalMetadata(rootCtx, key, value); err != nil {
+								if errors.Is(err, embeddeddolt.ErrReadOnly) {
+									debug.Logf("tip auto-commit: store is read-only, skipping tip metadata: %v", err)
+									tipWritesRefused = true
+									break
+								}
 								return HandleError("dolt tip auto-commit failed: %v", err)
 							}
 						}
 
-						ids := make([]string, 0, len(commandTipIDsShown))
-						for tipID := range commandTipIDsShown {
-							ids = append(ids, tipID)
-						}
-						msg := formatDoltAutoCommitMessage("tip", getActor(), ids)
-						if err := runPostRunAutoCommit(rootCtx, doltAutoCommitParams{Command: "tip", MessageOverride: msg}); err != nil {
-							return HandleError("dolt tip auto-commit failed: %v", err)
+						if !tipWritesRefused {
+							ids := make([]string, 0, len(commandTipIDsShown))
+							for tipID := range commandTipIDsShown {
+								ids = append(ids, tipID)
+							}
+							msg := formatDoltAutoCommitMessage("tip", getActor(), ids)
+							if err := runPostRunAutoCommit(rootCtx, doltAutoCommitParams{Command: "tip", MessageOverride: msg}); err != nil {
+								return HandleError("dolt tip auto-commit failed: %v", err)
+							}
 						}
 					}
 				}
@@ -1849,13 +1948,22 @@ func flushBatchCommitOnShutdown() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := st.Commit(ctx, "bd: flush pending changes on shutdown"); err != nil {
+	// CommitPending reports atomically whether a commit actually landed, so a
+	// clean shutdown stays quiet without spending the 5s flush budget on
+	// HEAD-reporting probes before the commit itself (and without racing a
+	// concurrent writer's HEAD movement the way a before/after compare would).
+	committed, err := st.CommitPending(ctx, getActorWithGit())
+	if err != nil {
 		if !isDoltNothingToCommit(err) {
 			fmt.Fprintf(os.Stderr, "\nWarning: failed to flush batch commit on shutdown: %v\n", err)
 		}
-	} else {
-		fmt.Fprintf(os.Stderr, "\nFlushed pending batch commit on shutdown\n")
+		return
 	}
+	if !committed {
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "\nFlushed pending batch commit on shutdown\n")
 }
 
 // validateWorkspaceIdentity checks that the project identity from metadata.json
