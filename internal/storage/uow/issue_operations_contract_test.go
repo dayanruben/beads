@@ -122,6 +122,41 @@ func TestIssueOperationsUpdatePersistentPreservesUnversionedClass(t *testing.T) 
 	conformance.RunIssueOperationsUpdatePersistentPreservesUnversionedClass(t, ctx, newUOWIssueOperationsFixture(t, ctx))
 }
 
+func TestIssueOperationsCreateWritesEveryScalarField(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsCreateWritesEveryScalarField(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsUpdateWritesEveryScalarPatchField(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateWritesEveryScalarPatchField(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateRefusesATypeOutsideTheWorkspaceVocabulary(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsUpdateClaimIsAMutationWhenThePatchRestoresTheRow(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateClaimIsAMutationWhenThePatchRestoresTheRow(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsUpdateStatusCrossingSettlesDependers(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsUpdateStatusCrossingSettlesDependers(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsCreateWithDependenciesSettlesInTheCreatingTransaction(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsCreateWithDependenciesSettlesInTheCreatingTransaction(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
+func TestIssueOperationsClaimLeavesBlockedStateAlone(t *testing.T) {
+	ctx := context.Background()
+	conformance.RunIssueOperationsClaimLeavesBlockedStateAlone(t, ctx, newUOWIssueOperationsFixture(t, ctx))
+}
+
 func newUOWIssueOperationsFixture(t *testing.T, ctx context.Context) conformance.IssueOperationsStagingFixture {
 	t.Helper()
 	operations, provider := newRealIssueOperationsWithProvider(t, ctx)

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -250,6 +251,58 @@ func (c *roleBatchCreator) createRequests() []issueops.CreateBatchRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]issueops.CreateBatchRequest(nil), c.requests...)
+}
+
+// roleDependencyEditor is the store-shaped source's graph-write role.
+//
+// It records the request each method was handed, because what is worth
+// asserting at this seam is that the WIRE's members reach the role unrewritten.
+// The graph rules themselves — the cycle gate, the hierarchy refusal, the type
+// conflict, the endpoint existence checks — belong to the conformance contract
+// over DependencyEditor, and the handler tests drive them by handing this fake
+// the typed error the role would have raised.
+type roleDependencyEditor struct {
+	addErr    error
+	removed   bool
+	removeErr error
+
+	mu      sync.Mutex
+	adds    []issueops.AddDependenciesRequest
+	removes []issueops.RemoveDependencyRequest
+}
+
+func (e *roleDependencyEditor) AddDependencies(_ context.Context, req issueops.AddDependenciesRequest) (issueops.AddDependenciesResult, error) {
+	e.mu.Lock()
+	e.adds = append(e.adds, req)
+	e.mu.Unlock()
+	if e.addErr != nil {
+		return issueops.AddDependenciesResult{}, e.addErr
+	}
+	// The role's own echo: all-or-nothing means it is either every requested
+	// edge or the call failed.
+	return issueops.AddDependenciesResult{Added: slices.Clone(req.Edges)}, nil
+}
+
+func (e *roleDependencyEditor) RemoveDependency(_ context.Context, req issueops.RemoveDependencyRequest) (issueops.RemoveDependencyResult, error) {
+	e.mu.Lock()
+	e.removes = append(e.removes, req)
+	e.mu.Unlock()
+	if e.removeErr != nil {
+		return issueops.RemoveDependencyResult{}, e.removeErr
+	}
+	return issueops.RemoveDependencyResult{Removed: e.removed}, nil
+}
+
+func (e *roleDependencyEditor) addRequests() []issueops.AddDependenciesRequest {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]issueops.AddDependenciesRequest(nil), e.adds...)
+}
+
+func (e *roleDependencyEditor) removeRequests() []issueops.RemoveDependencyRequest {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]issueops.RemoveDependencyRequest(nil), e.removes...)
 }
 
 // roleMemories is the store-shaped source's persistent-memory role — the one
@@ -569,6 +622,9 @@ func rolesConfig(cfg Config) Config {
 	if cfg.BatchCreator == nil {
 		cfg.BatchCreator = &roleBatchCreator{}
 	}
+	if cfg.DependencyEditor == nil {
+		cfg.DependencyEditor = &roleDependencyEditor{}
+	}
 	if cfg.Memories == nil {
 		cfg.Memories = &roleMemories{}
 	}
@@ -673,9 +729,9 @@ func countedPage() []*types.IssueWithCounts {
 //
 // The two refusals are different mistakes and must stay distinguishable. A
 // PARTIAL set is the dangerous one: a Config carrying a reader and no claimer
-// would bind, answer every read, and fail the one write on this surface with a
-// nil dereference — at claim time, in a handler, on a live server. Each role an
-// operation reaches has a row below for that reason.
+// would bind, answer every read, and fail every claim with a nil dereference —
+// at claim time, in a handler, on a live server. Each role an operation reaches
+// has a row below for that reason.
 func TestListenRequiresExactlyOneDatabaseSource(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -1399,11 +1455,9 @@ func (s hookableStore) IssueClaimer() (issueops.Claimer, error) { return s.claim
 
 // TestListenRefusesARoleThatFiresTheWorkspaceHooks.
 //
-// `bd serve` documents that hooks do not fire, and until roles became
-// configuration nothing could make them: the provider seam builds its claimer
-// from a unit of work, which carries no hook layer at all. A store is the
-// opposite — its accessors hand out its decorators, deliberately, so that a CLI
-// claim keeps its on_update — and bd's own chain is
+// `bd serve` documents that hooks do not fire, and a store is the surface that
+// most easily makes them: its accessors hand out its decorators, deliberately,
+// so that a CLI claim keeps its on_update — and bd's own chain is
 // caller -> HookFiringStore -> InstrumentedStorage -> raw. So the one line a
 // caller with a store would obviously write, store.IssueClaimer(), returns
 // exactly the claimer this server may not serve.
@@ -1450,6 +1504,47 @@ func TestListenRefusesARoleThatFiresTheWorkspaceHooks(t *testing.T) {
 	srv, err := listen(fromBeneath)
 	if err != nil {
 		t.Fatalf("Listen: %v, want a bound server for the claimer beneath the hook layer", err)
+	}
+	t.Cleanup(func() { _ = srv.http.Close() })
+}
+
+// serveHookRunner stands in for the workspace's script runner. The refusal is
+// about the provider's TYPE, so this never has to run.
+type serveHookRunner struct{}
+
+func (serveHookRunner) Run(string, *types.Issue) {}
+
+// TestListenRefusesAProviderThatFiresTheWorkspaceHooks is the same refusal for
+// the other database source.
+//
+// The unit-of-work seam used to carry no hook layer, so the provider arm could
+// not break the no-hooks contract. It can now: proxied mode wraps its provider
+// so the CLI's writes fire hooks on both plumbings, and that provider is the
+// one `bd serve` finds already open. Serving it would run a user's subprocess
+// per landed mutation, for as long as the server is up.
+func TestListenRefusesAProviderThatFiresTheWorkspaceHooks(t *testing.T) {
+	inner := &fakeProvider{}
+	notifying := uow.NewNotifyingProvider(inner, uow.Sinks{Hook: serveHookRunner{}})
+	if !uow.ProviderFiresHooks(notifying) {
+		t.Fatal("the notifying provider no longer reports that it fires hooks; this test proves nothing")
+	}
+
+	listen := func(p uow.UnitOfWorkProvider) (*Server, error) {
+		cfg := Config{Provider: p, Addr: "127.0.0.1:0", Stdout: io.Discard, Stderr: io.Discard}
+		return Listen(cfg)
+	}
+
+	if _, err := listen(notifying); err == nil {
+		t.Error("Listen bound a server whose every mutation runs the workspace's hook scripts")
+	} else if !strings.Contains(err.Error(), "hooks") {
+		t.Errorf("refusal %q does not say what is wrong with the provider", err)
+	}
+
+	// And the provider BENEATH the hook layer — the value the refusal sends a
+	// caller to, and what cmd/bd hands Listen — has to be servable.
+	srv, err := listen(uow.UnwrapProvider(notifying))
+	if err != nil {
+		t.Fatalf("Listen: %v, want a bound server for the provider beneath the hook layer", err)
 	}
 	t.Cleanup(func() { _ = srv.http.Close() })
 }
