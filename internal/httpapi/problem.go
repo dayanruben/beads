@@ -59,6 +59,45 @@ const (
 	// sentinel's message text.
 	CodeAlreadyClaimed Code = "already_claimed"
 	CodeNotClaimable   Code = "not_claimable"
+	// CodeNotReleasable is a row refusing to give up a claim, and it covers
+	// the two conditions releaseIssue's role reports for that: the row holds
+	// no claim, or its status is neither open nor in_progress.
+	//
+	// A 409 for CodeNotClosable's reason: the body is well-formed and STATE
+	// refuses it, so the same request succeeds or fails on something the client
+	// cannot see without reading it.
+	//
+	// IT IS MINTED RATHER THAN FOLDED INTO CodeNotClaimable, which is the
+	// nearest existing code and covers a superset of the same statuses today.
+	// The coincidence is not a contract: the release transition is pinned to
+	// {open, in_progress} by releasableStatus and the claim's eligibility is a
+	// separate predicate, so the two sets are free to diverge and would then be
+	// one code meaning two things. Worse, the unheld half would be an outright
+	// lie — an open, unassigned row is the MOST claimable row a workspace has,
+	// and answering `not_claimable` about it would send a client somewhere
+	// there is nothing to find.
+	//
+	// IT COVERS BOTH CONDITIONS UNDER ONE CODE, and that is a deliberate
+	// start-narrow CHOICE rather than a consequence of missing information.
+	//
+	// THE TWO CONDITIONS ARE FULLY DISTINGUISHABLE HERE. ErrNotClaimed and
+	// ErrNotReleasable are two distinct typed sentinels, and failRelease holds
+	// both in one case arm — so a future split needs no archeology and no
+	// prose-scraping: it is a mapping change in that arm plus a code in this
+	// block and a line in the document. What IS unavailable typed is the
+	// OBSERVATION either refusal made — the status it saw, the emptiness of the
+	// assignee — because both format those into their messages and this surface
+	// does not scrape its own prose. That is why the code carries no extension
+	// member, and it is a narrower statement than "the refusals are
+	// indistinguishable", which they are not.
+	//
+	// The split is deferred rather than refused because one code is the
+	// reversible direction: splitting later is an ADDITION, which the document
+	// already tells clients to tolerate, while merging two published codes into
+	// one is the removal that breaks the wire. A client that needs the
+	// distinction before then reads the row, which the operation description
+	// tells it to do for a safety reason rather than a taste one.
+	CodeNotReleasable Code = "not_releasable"
 	// CodeNotClosable is close policy refusing an unforced close: open
 	// children, or a live blocker. The open-children refusal carries the count
 	// in the `open_children` extension member, read inside the refusing
@@ -82,6 +121,86 @@ const (
 	// CodeDependencyExists is the pair that already carries an edge of a
 	// DIFFERENT type, with both types in `existing_type`/`requested_type`.
 	CodeDependencyExists Code = "dependency_exists"
+	// CodeAlreadyExists is a create whose EXPLICIT id already names a stored
+	// row. `param` names the offending member and, on a batch operation, the
+	// item members name which item carried it.
+	//
+	// A 409 rather than a 400, and the distinction is the one CodeNotClosable
+	// draws: the request is well-formed and stays well-formed: what refuses it
+	// is STATE the client cannot see without reading it, and recovery is to
+	// look at that state — adopt the row, pick another id, or stop. A 400 says
+	// "this body is malformed, fix it and it will work", which is false here:
+	// the identical body succeeded before the id was taken and would succeed
+	// again against a workspace that never took it.
+	//
+	// It is minted rather than folded into CodeInvalidArgument because the two
+	// are not narrowable later: widening a 400 to a 409 changes the status an
+	// existing client dispatches on, while a 409 that turns out to be
+	// unreachable retires for free.
+	CodeAlreadyExists Code = "already_exists"
+	// CodePreconditionFailed is a compare-and-set guard that MISSED on an
+	// operation whose contract is that a miss refuses everything. The expected
+	// values travel in typed extension members; a batch operation adds the
+	// members naming which item carried the guard.
+	//
+	// A 409 for CodeNotClosable's reason: the request is fine as a request and
+	// the STATE refuses it, so the same body succeeds or fails on something the
+	// client cannot see without reading it.
+	//
+	// IT IS NOT THE ANSWER TO EVERY LOST COMPARE-AND-SET on this surface, and
+	// the split is the point. Where a miss is the ordinary path of a retry loop
+	// — the metadata compare-and-set — it is a 200 carrying the current value,
+	// because putting a loop's normal iteration in the error channel would make
+	// the value that loop needs next travel as a problem member. This code is
+	// for the opposite contract: a guard on one step of a plan the caller meant
+	// to land whole, where a miss took the entire request down and there is
+	// nothing to report but the refusal.
+	//
+	// The expected/actual members are SPLIT BY TYPE — expected_version and
+	// actual_version, expected_status and actual_status, expected_assignee and
+	// actual_assignee — rather than one polymorphic pair, because a generic
+	// `expected`/`actual` of "a version or a status or an assignee" is a schema
+	// alternation and this document's x-go-type doctrine admits no composition
+	// keyword to spell one.
+	CodePreconditionFailed Code = "precondition_failed"
+	// CodeEventsJournalDisabled is the events journal being OFF on the served
+	// workspace. It exists because the alternative answer is a lie: a disabled
+	// journal reads as zero rows and a head of zero, which is byte-identical to
+	// an enabled journal nothing has written to yet — so a consumer would poll a
+	// workspace that will never produce a record and call it "caught up"
+	// forever. This is the one refusal on this surface that a client cannot
+	// discover any other way.
+	//
+	// A 409 for the reason CodeNotClosable gives: it is a statement about the
+	// current state of the workspace, which the same request stops earning the
+	// moment an operator sets `events-journal true` and restarts the server.
+	// Not a 404 — the operation and the resource both exist — and not a 501,
+	// which this surface reserves for an operation this BUILD does not
+	// implement, whereas every build implements this one.
+	CodeEventsJournalDisabled Code = "events_journal_disabled"
+	// CodeEventsJournalTruncated is a journal read whose checkpoint has fallen
+	// below the retained window. The value is storage's own constant, so the
+	// code a `bd events tail --json` failure carries and the code this surface
+	// emits cannot drift to two spellings of one condition.
+	//
+	// A 410 Gone, and the only one in the vocabulary: the records the caller
+	// asked for existed, were addressable by exactly this request, and have been
+	// deliberately deleted. That is what 410 means and what 404 does not — a 404
+	// would say the resource never existed and invite a retry, and the whole
+	// point of this refusal is that retrying the same `since` can never succeed.
+	// The `since`, `floor` and `head` members carry the window the server can
+	// still serve, so the recovery (resume from `floor - 1` and accept the gap,
+	// or re-baseline) is a decision the client makes from data rather than prose.
+	CodeEventsJournalTruncated Code = Code(storage.EventsJournalTruncatedCode)
+	// CodeEventsWatchSaturated is this server already holding as many open
+	// journal streams as it will. It is not CodeBusy, even though both are a
+	// 503 with a Retry-After, because the two carry different recoveries: busy
+	// says the database is congested and the same request will work shortly,
+	// while this says a bounded resource is fully subscribed by connections that
+	// may last hours — and the caller has a second recovery available that busy
+	// does not offer, namely the paged read, which holds nothing between
+	// requests and is never refused for this reason.
+	CodeEventsWatchSaturated Code = "events_watch_saturated"
 	// CodeBusy is retryable contention: the transaction retry budget was
 	// exhausted, or the in-flight request limit was saturated.
 	CodeBusy Code = "busy"
@@ -107,11 +226,20 @@ var codeStatus = map[Code]int{
 	CodeAlreadyClaimed:   http.StatusConflict,
 	CodeNotClaimable:     http.StatusConflict,
 	CodeNotClosable:      http.StatusConflict,
+	CodeNotReleasable:    http.StatusConflict,
 	CodeDependencyCycle:  http.StatusConflict,
 	CodeDependencyExists: http.StatusConflict,
-	CodeBusy:             http.StatusServiceUnavailable,
-	CodeDBUnavailable:    http.StatusServiceUnavailable,
-	CodeInternal:         http.StatusInternalServerError,
+	CodeAlreadyExists:    http.StatusConflict,
+
+	CodePreconditionFailed: http.StatusConflict,
+
+	CodeEventsJournalDisabled:  http.StatusConflict,
+	CodeEventsJournalTruncated: http.StatusGone,
+	CodeEventsWatchSaturated:   http.StatusServiceUnavailable,
+
+	CodeBusy:          http.StatusServiceUnavailable,
+	CodeDBUnavailable: http.StatusServiceUnavailable,
+	CodeInternal:      http.StatusInternalServerError,
 }
 
 // Status returns the HTTP status frozen to c, or 0 if c is not in the v0
@@ -161,6 +289,12 @@ const (
 	// retryAfterSaturation follows an in-flight-limit wait timeout. Slot
 	// pressure clears quickly.
 	retryAfterSaturation = 1
+	// retryAfterWatchSaturation follows a refused journal stream. Streams are
+	// held for as long as their consumers stay connected — minutes to hours —
+	// so a slot opens on a human timescale rather than a request one, and the
+	// one-second comeback the slot limiter offers would be a busy loop against a
+	// condition that has not changed.
+	retryAfterWatchSaturation = 30
 )
 
 // ErrBusy reports that the in-flight request limiter refused to admit the
@@ -177,6 +311,40 @@ const (
 	OpListIssues    = "listIssues"
 	OpGetIssue      = "getIssue"
 	OpClaimIssue    = "claimIssue"
+	// OpBatchCloseIssues closes many issues as one transaction, behind
+	// issueops.BatchCloser. It is the surface's ONLY operation whose 200 body
+	// carries refusals: the role is deliberately not all-or-nothing, so an id
+	// it turns down is skipped and the survivors commit.
+	//
+	// Its problem vocabulary is therefore narrow rather than wide — everything
+	// an ITEM can earn lives in that item's outcome, and a problem document
+	// from this operation means the batch NEVER RAN.
+	OpBatchCloseIssues = "batchCloseIssues"
+	// OpClaimNextIssue takes ONE ready issue and hands it back claimed, behind
+	// issueops.ReadyClaimer. It is the surface's first operation that names no
+	// row at all: the caller sends a QUESTION — the ready listing's own filter
+	// vocabulary — and the role picks the answer.
+	//
+	// It exists to retire a RACE rather than a round trip. The listing-then-claim
+	// composition it replaces reads a row another agent claims before the second
+	// request arrives, so a fleet polling one queue earns 409s for rows it was
+	// correctly offered.
+	OpClaimNextIssue = "claimNextIssue"
+	// OpReleaseIssue gives a claim back — the claim's inverse, and what
+	// `bd unclaim` spells. It is a named lifecycle action rather than a status
+	// patch for OpCloseIssue's reason: an update spells the release three
+	// fields at a time, which puts the transition's definition in the caller,
+	// and the lease it drops is the part a patch cannot express at all.
+	//
+	// It is the one write on this surface that is NOT idempotent, and the
+	// asymmetry with the claim is a fact about the two post-states rather than
+	// a preference: a claim's post-state names the claimant, so a re-claim is
+	// recognizable and can answer 200. A release leaves an anonymous row, so
+	// "I released this twice", "a reaper beat me to it" and "nothing ever
+	// claimed it" are one row — and one 200 for three situations that want
+	// different things from a caller. It answers 409 instead and lets the
+	// caller decide which of them it can live with.
+	OpReleaseIssue = "releaseIssue"
 	// OpCloseIssue is the second half of the agent loop this surface exists to
 	// serve: claim, work, close. It is a named lifecycle action rather than a
 	// status patch because Close carries semantics a patch has nowhere to put —
@@ -184,13 +352,23 @@ const (
 	// normalization, and the close policy vocabulary.
 	OpCloseIssue = "closeIssue"
 	// OpReopenIssue is the close's mirror, and it completes the lifecycle pair
-	// so a recovery flow works end to end over this surface. It is the one
-	// write here with no conflict code: reopen has no policy guard.
+	// so a recovery flow works end to end over this surface. It is the one write
+	// here with no POLICY conflict code: reopen takes an issue OUT of the done
+	// category, so there is no state of the graph that can refuse it. Its one
+	// 409 is the caller's own compare-and-set, which is a fact about the
+	// request's premise rather than about the graph.
 	OpReopenIssue = "reopenIssue"
-	// OpUpdateIssue edits the FIELDS of one issue. Lifecycle is deliberately not
-	// among them: status belongs to close/reopen/claim, which carry the policy
-	// and conflict vocabulary, and assignee belongs to the claim's
-	// compare-and-set. Keeping both out is why this operation has no 409.
+	// OpUpdateIssue edits the FIELDS of one issue, including the three that
+	// carry policy: `status`, `assignee` and `parent_id`.
+	//
+	// It USED to exclude all three, and to have no 409 because of it. The
+	// exclusion did not survive contact with a caller: an edit that moves a
+	// status alongside other fields in one transaction is the thing two calls
+	// cannot do, `issues:batchApply`'s update item has published all three since
+	// it landed, and keeping them off here meant the two operations disagreed
+	// about what patching one issue means. They are the SAME refusals here as
+	// there — close policy, the assignee fence, the graph's two — and the named
+	// lifecycle operations keep the semantics a status write has nowhere to put.
 	OpUpdateIssue          = "updateIssue"
 	OpListSettings         = "listSettings"
 	OpGetSetting           = "getSetting"
@@ -230,8 +408,30 @@ const (
 	// refusals include a question about the GRAPH — a named bead with a
 	// dependent the request did not name.
 	OpDeleteIssues = "deleteIssues"
+	// OpCreateIssue creates ONE issue, with its parent, its explicit edges and
+	// its waits-for gate, as one transaction. It is the plain collection POST
+	// batchCreateIssues left free by spelling itself as a custom method.
+	//
+	// It publishes the whole create vocabulary rather than that operation's
+	// narrow item — `status`, `sender`, `metadata`, `ephemeral`, `no_history`
+	// and an explicit `id` included — which is what makes it usable for a
+	// caller composing a real row, and which is also where its two conflict
+	// codes come from: an occupied id, and the graph refusing the edges the
+	// request asked for.
+	OpCreateIssue = "createIssue"
 	// OpBatchCreateIssues creates many issues as one transaction, or none.
 	OpBatchCreateIssues = "batchCreateIssues"
+	// OpApplyBatch applies an ORDERED, heterogeneous plan — creates, updates,
+	// closes and dependency edges together — as one transaction, or none of it.
+	// It is the only operation here whose request expresses a graph that
+	// references its own items: a create may NAME itself and later items address
+	// it by that name.
+	//
+	// It is therefore the widest refusal vocabulary on this surface, and every
+	// entry is inherited rather than invented: it can earn the lifecycle's
+	// close-policy conflict, the claim's assignee fence and both of the graph's
+	// conflicts, because it performs all three families of write.
+	OpApplyBatch = "applyBatch"
 	// OpRememberMemory stores one memory, behind memoryops.Memories. It is the
 	// first operation on this surface that reaches a role outside issueops: the
 	// memory plane is user data riding in the config table, not settings, and
@@ -251,6 +451,33 @@ const (
 	// It is the operation that makes stored memories DISCOVERABLE rather than
 	// merely readable by a caller who already knows a key.
 	OpListMemories = "listMemories"
+	// OpListEvents pages the durable mutation journal from a caller-held
+	// checkpoint. It is the first operation on this surface whose paging is not
+	// a cursor this server minted: `since` is a sequence number the journal
+	// itself assigned, so a consumer's position survives a restart on either
+	// side and is meaningful to `bd events tail` as well.
+	//
+	// It is a READ of a log, not a subscription: the paged form has no follow
+	// mode and never will. The retention contract is what makes that safe to
+	// publish — a consumer that falls too far behind is told so with
+	// `events_journal_truncated` rather than served a silently shortened history.
+	OpListEvents = "listEvents"
+	// OpWatchEvents pushes the same journal over a held-open text/event-stream
+	// response, resuming from the same checkpoint. It is a sibling of the paged
+	// read rather than a mode of it: the contracts differ in media type,
+	// lifetime, limits and capacity, and one operation carrying both would have
+	// documented two of everything under one operationId.
+	//
+	// It is the surface's ONLY streaming operation, and the only one whose
+	// response can report a failure after its status is written — a prune that
+	// races an open stream arrives as a named event rather than as the 410 the
+	// same condition earns at connect.
+	OpWatchEvents = "watchEvents"
+	// OpCompareAndSetMetadata conditionally sets one metadata key on an issue.
+	// It is the only WRITE on this surface whose ordinary refusal is a 200: a
+	// lost race is the answer to the question the caller asked, and the value
+	// that refused the swap is what its retry needs next.
+	OpCompareAndSetMetadata = "compareAndSetMetadata"
 )
 
 // operationCodes is the per-operation problem vocabulary: exactly the codes
@@ -329,36 +556,113 @@ var operationCodes = map[string][]Code{
 	// CodeNotFound is the one this operation has and the sweep does not: a
 	// sweep describes a set that can legitimately be empty, while a delete
 	// names beads and an id that resolves to nothing is a caller mistake.
-	OpDeleteIssues: {CodeInvalidArgument, CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
+	//
+	// precondition_failed is `expected_version`'s, and it is the 409 form for
+	// the reason that code documents: a miss refuses the whole request and
+	// leaves nothing to report but the refusal. It ranks BELOW the 404 — a
+	// request that named no row has nothing to be stale about — and ABOVE the
+	// dependents refusal, which is the role's own order and is what makes the
+	// wire's answer the same one `bd delete` gives.
+	//
+	// The ARITY refusal is a 400 rather than a second conflict: a token beside
+	// two distinct ids is a malformed request, not a statement about state.
+	OpDeleteIssues: {
+		CodeInvalidArgument, CodeNotFound, CodePreconditionFailed,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
 	OpClaimIssue: {
 		CodeInvalidArgument, CodeNotFound, CodeAlreadyClaimed, CodeNotClaimable,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},
-	// The 409 is close POLICY, and it is the only conflict this operation has:
-	// an unforced close refused for open children or for a live blocker. There
-	// is no already_claimed here — closing work somebody else holds is not a
-	// refusal on this surface — and the idempotent re-close is a 200 carrying
-	// `already_closed`, the claim's answer to the same question.
-	OpCloseIssue: {
-		CodeInvalidArgument, CodeNotFound, CodeNotClosable,
-		CodeBusy, CodeDBUnavailable, CodeInternal,
-	},
-	// NO 409, and the absence is the point. Close has a policy guard — open
-	// children, a live blocker — and reopen is the direction that takes an issue
-	// OUT of the done category rather than putting it in, so there is no state
-	// of the graph that can refuse it and nothing to name. The idempotent case
-	// is a 200 carrying `already_open`, not a conflict.
-	OpReopenIssue: {
+	// The NARROWEST write vocabulary on this surface, and the narrowness is the
+	// contract rather than an oversight. A problem document from this operation
+	// means the batch never ran; every refusal an ITEM can earn — not_found for
+	// an id naming no row, not_closable for close policy — travels in that
+	// item's outcome inside a 200. A 404 here would say the operation went to
+	// the wrong place, and a 409 would say the whole batch was refused, and
+	// neither is ever true of a per-item refusal.
+	OpBatchCloseIssues: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// NO 409 AND NO 404, and both absences are this operation's contract rather
+	// than an omission. There is no id to have missed, and a row a racing agent
+	// took is simply not in the set this claim scanned — the role walks past it
+	// inside the transaction, which is the whole reason the operation exists.
+	// An empty ready front is a 200 with the row absent, not a refusal.
+	//
+	// The 400 is the ready listing's filter vocabulary plus this operation's own
+	// `limit` refusal plus the body rules, and the ROLE's ErrValidation behind
+	// them, which is defensively unreachable.
+	OpClaimNextIssue: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// THREE conflict codes, and only one of them is new. `already_claimed` is
+	// the ownership fence, inherited from updateIssue's assignee arm: the same
+	// situation — a live foreign owner refusing a write — with the same two
+	// bypasses, spelled `force` and `expected_assignee` here. `precondition_failed`
+	// is the `expected_assignee` guard, inherited from the same operation and
+	// carrying the same members for the same reason: the request's expectation,
+	// never an observation.
+	//
+	// `not_releasable` is the mint, and its own doc carries the analysis.
+	//
+	// The 404 is the path id's, on the terms updateIssue states. There is no
+	// `not_claimable` here even though the claim's status refusal is the nearest
+	// neighbor — see CodeNotReleasable for why that reuse was refused.
+	OpReleaseIssue: {
 		CodeInvalidArgument, CodeNotFound,
+		CodeAlreadyClaimed, CodeNotReleasable, CodePreconditionFailed,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},
-	// No conflict code, and the excluded members are exactly where one would
-	// have entered: `status` would drag in close policy, `assignee` the claim
-	// fence, `parent_id` the graph vocabulary. The 400 is the body vocabulary
-	// plus the ROLE's ErrValidation — a workspace-vocabulary issue_type, a
-	// field-length refusal that slipped the edge check — through failUpdate.
+	// TWO 409s, and they answer different questions with `code` as the only
+	// discriminator a client needs.
+	//
+	// not_closable is close POLICY: an unforced close refused for open children
+	// or for a live blocker. There is no already_claimed here — closing work
+	// somebody else holds is not a refusal on this surface — and the idempotent
+	// re-close is a 200 carrying `already_closed`, the claim's answer to the
+	// same question.
+	//
+	// precondition_failed is `expected_version`'s, in the 409 form for the
+	// reason that code documents, and it is CHECKED FIRST — before policy and
+	// before the idempotent re-close, which is the role's own order
+	// (issueops.Lifecycle.Close). `force` bypasses policy and never it: the two
+	// members make unrelated claims.
+	OpCloseIssue: {
+		CodeInvalidArgument, CodeNotFound, CodeNotClosable, CodePreconditionFailed,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
+	// ONE 409, and it is a PRECONDITION rather than a policy. Close has a policy
+	// guard — open children, a live blocker — and reopen is the direction that
+	// takes an issue OUT of the done category rather than putting it in, so
+	// there is no state of the graph that can refuse it: not_closable is absent
+	// here and always will be. What `expected_version` refuses is the request's
+	// own premise, which every write can have wrong. The idempotent case is
+	// still a 200 carrying `already_open`, unless a guard came with it.
+	OpReopenIssue: {
+		CodeInvalidArgument, CodeNotFound, CodePreconditionFailed,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
+	// FOUR conflict codes, and the three members that publish them are exactly
+	// the ones this row used to say would drag them in: `status` brought close
+	// policy, `assignee` the fence, `parent_id` the graph vocabulary. Publishing
+	// the members is what made the codes reachable, and every one of them is
+	// inherited from an operation that already has it — this is applyBatch's row
+	// for a single update item, minus `already_exists`, which needs a create.
+	//
+	// precondition_failed is the guard trio's, and it is the 409 form rather
+	// than compareAndSetMetadata's 200 for the reason that code documents: a
+	// miss here refuses the whole write and leaves nothing to report but the
+	// refusal, where a lost metadata swap is a retry loop's ordinary iteration
+	// carrying the value it needs next.
+	//
+	// The 404 is still the PATH id only. A `patch.parent_id` that names nothing
+	// is an edge endpoint and stays a 400, conforming to addDependencies.
+	//
+	// The 400 is the body vocabulary plus the ROLE's ErrValidation — a
+	// workspace-vocabulary issue_type or status, a metadata key the query layer
+	// could not spell, a field-length refusal that slipped the edge check —
+	// through failUpdate.
 	OpUpdateIssue: {
 		CodeInvalidArgument, CodeNotFound,
+		CodePreconditionFailed, CodeNotClosable, CodeAlreadyClaimed,
+		CodeDependencyCycle, CodeDependencyExists,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},
 	// No not_found. The role refuses an edge whose target names nothing, and
@@ -371,6 +675,58 @@ var operationCodes = map[string][]Code{
 	// item can collide with a stored row and the role's ErrAlreadyExists is
 	// unreachable from the wire.
 	OpBatchCreateIssues: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The batch's row plus the two codes its narrower vocabulary cannot earn,
+	// and both additions are members rather than judgement calls.
+	//
+	// already_exists arrives with `id`: that operation publishes none, so its
+	// items can never collide with a stored row and the role's ErrAlreadyExists
+	// is unreachable from its wire. Here it is reachable and it is a 409 for
+	// CodeNotClosable's reason — the body is well-formed and STATE refuses it.
+	//
+	// dependency_cycle arrives with `parent_id` and `dependencies[].reverse`:
+	// the first places the new row inside a hierarchy the caller cannot see, so
+	// a blocking edge against its own ancestor is refusable, and the second
+	// writes an edge INTO the id being minted, which is the only way a create
+	// can close a scheduling cycle at all. It is addDependencies' 409 unchanged,
+	// including the hierarchy discriminator.
+	//
+	// NO 404 and no dependency_exists. A target that names nothing is a
+	// statement about the request body rather than a resource this operation was
+	// asked to address — batchCreateIssues' argument, and there is no id in this
+	// path to have missed. And the only type conflict a create can raise is
+	// between two edges of the SAME request, which is a malformed body: no
+	// stored edge can name a pair whose endpoint is an id this request is
+	// minting.
+	OpCreateIssue: {
+		CodeInvalidArgument, CodeAlreadyExists, CodeDependencyCycle,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
+	// The widest row here, and every code on it is inherited from an operation
+	// that already has it: this one performs the lifecycle's writes, the claim's
+	// assignee transfer and the graph's edge assertions inside one transaction,
+	// so it can earn any refusal any of them can.
+	//
+	// THERE IS A CONFLICT CODE HERE, unlike the metadata compare-and-set, and
+	// that is the whole difference between the two contracts rather than a
+	// difference of taste. A lost compare-and-set is that operation's ORDINARY
+	// path — a retry loop is its designed caller — so a 409 there would put the
+	// normal iteration in the error channel and force the value the loop needs
+	// next into a problem member. Here a precondition miss refuses every item in
+	// the request, so there is no partial outcome to report on a 200 and nothing
+	// for a client to do with one: the refusal IS the answer, and it belongs
+	// where every other "the state says no" on this surface lives.
+	//
+	// The 404 is the delete's, not the batch create's: `update` and `close`
+	// items NAME rows this request acts on, so a target that resolves to nothing
+	// is a resource the request failed to address. An EDGE endpoint stays a 400,
+	// conforming to addDependencies — nothing in that refusal is about a
+	// resource this operation was asked to address.
+	OpApplyBatch: {
+		CodeInvalidArgument, CodeNotFound,
+		CodePreconditionFailed, CodeNotClosable, CodeAlreadyClaimed, CodeAlreadyExists,
+		CodeDependencyCycle, CodeDependencyExists,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
 	// No 404 and no conflict code: this is an UPSERT with a server-derivable
 	// key, so there is no resource it can fail to address and no row it can
 	// collide with. Its 400 is the body vocabulary plus the ROLE's two
@@ -394,12 +750,52 @@ var operationCodes = map[string][]Code{
 	// one of its values. No 404 — a search matching nothing is an empty page,
 	// because a question about a set has an answer even when the set is empty.
 	OpListMemories: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The two journal codes are this operation's alone and neither has a
+	// precedent elsewhere on this surface, because no other operation reads a
+	// LOG. The 400 is its own too: `since` is required, and a negative or
+	// unparseable checkpoint is refused rather than treated as zero — `seq > -5`
+	// would quietly serve the whole journal as if it were a legitimate resume,
+	// which is the same refusal `bd events tail --since` makes.
+	//
+	// No 404. A checkpoint at or past the head is a caught-up 200 with an empty
+	// list, because "nothing new yet" is an answer about a log rather than a
+	// missing resource, and a poller that got a 404 for being up to date would
+	// have to treat the surface's miss vocabulary as a normal steady state.
+	OpListEvents: {
+		CodeInvalidArgument, CodeEventsJournalDisabled, CodeEventsJournalTruncated,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
+	// THE PAGED READ'S VOCABULARY PLUS ONE, and the shared part is the point:
+	// every connect-time refusal a poller can earn, a stream earns identically,
+	// because the stream only opens once the same first read has succeeded. The
+	// 410 in particular is a real 410 here and not an in-band event — that
+	// mapping applies to a prune that races an ALREADY OPEN stream, where no
+	// status is left to send.
+	//
+	// events_watch_saturated is the addition, and it is the only code on this
+	// surface that describes a limit on connections rather than on data. Its 503
+	// therefore documents three codes where every other operation's documents
+	// two.
+	OpWatchEvents: {
+		CodeInvalidArgument, CodeEventsJournalDisabled, CodeEventsJournalTruncated,
+		CodeEventsWatchSaturated, CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
 	// NO 404, for a stronger version of the batch create's reason: an edge that
 	// is not there is `removed: false`, and an endpoint id that names nothing
 	// holds no edge either, so this operation probes no id's existence and has
 	// nothing it could report a miss on — listBlockingAnnotations' argument,
 	// applied to a write. No conflict code either: the removal is idempotent, so
 	// another caller having got there first is a success rather than a collision.
+	// NO CONFLICT CODE, and the absence is this operation's whole posture. A
+	// lost compare-and-set is a 200 carrying `swapped: false` and the current
+	// value, because a retry loop is the DESIGNED caller and a 409 would put its
+	// ordinary path in the error channel — and would have to smuggle the value
+	// that loop needs next into a problem extension member. The 404 is here for
+	// the id, which is the one refusal a caller cannot converge on.
+	OpCompareAndSetMetadata: {
+		CodeInvalidArgument, CodeNotFound,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
 	OpRemoveDependency: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
 	// The two conflict codes are this operation's alone, and both say the same
 	// kind of thing: the request is fine as a request and the GRAPH refuses it,
@@ -485,6 +881,114 @@ func (r Result) WithHierarchyConflict(issueID, blockerID string, blockerIsAncest
 	return r
 }
 
+// WithBatchItem attaches the four extension members that name WHICH item of a
+// batch earned a refusal: its index, its kind, the key it gave itself or the
+// key its target ref named, and the id it had resolved when the refusal
+// happened.
+//
+// They come from *issueops.ItemError's own fields — the typed error the role
+// raises rather than the prose it formats — for the reason every other typed
+// member on this envelope does, and one more that is this operation's alone:
+// the request is all or nothing, so there is no per-item result array for a
+// client to find the offender in. These members are the only place it exists.
+//
+// `item_key` and `item_issue_id` are OMITTED WHEN EMPTY, and both absences mean
+// something. An item that named nothing symbolically has no key; an item
+// refused before its target resolved — a create whose id was never minted, a
+// ref that resolved to nothing — has no id.
+//
+// It is `item_issue_id` rather than `issue_id` deliberately: `issue_id` is
+// already a PRESENCE-DISCRIMINATING member of the `dependency_cycle` hierarchy
+// refusal, and reusing it would make that discriminator fire on a refusal it
+// says nothing about.
+func (r Result) WithBatchItem(index int, kind, key, issueID string) Result {
+	r.Problem.ItemIndex = &index
+	r.Problem.ItemKind = &kind
+	if key != "" {
+		r.Problem.ItemKey = &key
+	}
+	if issueID != "" {
+		r.Problem.ItemIssueId = &issueID
+	}
+	return r
+}
+
+// WithDeclaredLater attaches the `declared_later` member, which tells an
+// unresolvable key that IS declared by a later item from one nothing in the
+// request declares at all. The first is an ordering mistake and the second is a
+// typo, and a client fixes them differently.
+//
+// It is emitted in BOTH polarities and never omitted to mean false, for
+// WithHierarchyConflict's reason applied to a 400: an absent member on this
+// operation's 400s means "this refusal was not about a key" and must not be
+// readable as "the key was not declared later".
+func (r Result) WithDeclaredLater(declaredLater bool) Result {
+	r.Problem.DeclaredLater = &declaredLater
+	return r
+}
+
+// WithExpectedVersion attaches the `expected_version` member of a
+// `precondition_failed`: the row version the request guarded on.
+//
+// It is the REQUEST's value rather than a read, which is why there is no
+// `actual_version` beside it here — see PreconditionFailed.
+func (r Result) WithExpectedVersion(expected int64) Result {
+	r.Problem.ExpectedVersion = &expected
+	return r
+}
+
+// WithExpectedStatus attaches the `expected_status` member of a
+// `precondition_failed`. Same source and same rule as WithExpectedVersion.
+func (r Result) WithExpectedStatus(expected string) Result {
+	r.Problem.ExpectedStatus = &expected
+	return r
+}
+
+// WithExpectedAssignee attaches the `expected_assignee` member of a
+// `precondition_failed`. Same source and same rule as WithExpectedVersion.
+func (r Result) WithExpectedAssignee(expected string) Result {
+	r.Problem.ExpectedAssignee = &expected
+	return r
+}
+
+// PreconditionFailed builds the 409 for a compare-and-set guard that missed on
+// an operation where a miss refuses the whole request.
+//
+// The detail says what a client does next rather than what the row held,
+// because on this contract those are different facts: the transaction that saw
+// the mismatch rolled back, so a value read afterwards describes a row the
+// refusal never saw. The role's refusals carry the expectation and not the
+// observation, so `actual_version`, `actual_status` and `actual_assignee` stay
+// absent here — the envelope declares them for an operation whose role can
+// report what it found, and inventing one from a later read would be worse than
+// omitting it.
+func PreconditionFailed() Result {
+	return newResult(CodePreconditionFailed,
+		"a precondition guard did not match; nothing was written, so re-read the row and recompose the request rather than retrying it")
+}
+
+// WithJournalWindow attaches the three `events_journal_truncated` extension
+// members: the checkpoint the reported window begins after, the lowest seq
+// still retained, and the highest seq ever assigned.
+//
+// They come from *storage.EventsJournalTruncatedError's own fields — computed
+// inside the transaction that saw the gap — for the reason every other typed
+// member on this envelope does, and one more: `since` is NOT always the value
+// the caller sent. On an interior hole it is the last seq the server could
+// serve contiguously from the caller's checkpoint, which is strictly the more
+// useful number and cannot be recovered by a client that assumed it was
+// echoing its own input back.
+//
+// All three are emitted together and none is omitted to mean zero: a head of 0
+// is a real journal state (nothing has ever been written), and a client
+// computing `floor - 1` needs the value rather than an absence to interpret.
+func (r Result) WithJournalWindow(since, floor, head int64) Result {
+	r.Problem.Since = &since
+	r.Problem.Floor = &floor
+	r.Problem.Head = &head
+	return r
+}
+
 // WithRequestID sets the `request_id` member, the correlation id echoed in the
 // request log line. It is what makes a 5xx actionable: the body carries a fixed
 // static detail by design, so the id is the client's only handle on the one log
@@ -550,6 +1054,40 @@ func NotFound() Result {
 	return newResult(CodeNotFound, "no issue or wisp with that id")
 }
 
+// EventsJournalDisabled builds the 409 for a workspace whose journal is off.
+//
+// The detail names the setting rather than describing the state, because the
+// recovery is entirely on the SERVER side — a client can do nothing about it —
+// and the human reading this response is the operator who has to go turn it on.
+func EventsJournalDisabled() Result {
+	return newResult(CodeEventsJournalDisabled,
+		"the durable events journal is not enabled on this workspace; set `events-journal true` and restart the server")
+}
+
+// EventsJournalTruncated builds the 410 for a checkpoint below the retained
+// window, carrying the window the server can still serve.
+//
+// The detail is the storage error's OWN sentence, which is the one `bd events
+// tail` prints. A consumer that reads both surfaces sees one description of one
+// condition, and this is a 4xx, so reflecting the server's own state here is
+// within what staticDetail allows.
+func EventsJournalTruncated(err *storage.EventsJournalTruncatedError) Result {
+	return newResult(CodeEventsJournalTruncated, err.Error()).
+		WithJournalWindow(err.Since, err.Floor, err.Head)
+}
+
+// EventsWatchSaturated builds the 503 for a stream this server will not hold.
+//
+// The detail names the alternative rather than the limit, because unlike every
+// other 503 here this one has a recovery that is not "wait": the paged read
+// answers the same records from the same checkpoint and is not capped this way.
+func EventsWatchSaturated() Result {
+	res := newResult(CodeEventsWatchSaturated,
+		"this server is already holding as many journal streams as it will; retry later, or read the same records from the same checkpoint with GET /v0/beads/events")
+	res.RetryAfterSeconds = retryAfterWatchSaturation
+	return res
+}
+
 // MemoryNotFound builds the 404 for a key this workspace holds no memory under.
 //
 // A separate constructor rather than a detail argument on NotFound, because the
@@ -565,10 +1103,42 @@ func MemoryNotFound() Result {
 // ClassifyError maps an error from the storage seam onto the wire. The caller
 // is responsible for logging err: everything mapped to a 5xx deliberately
 // drops the error text on the floor (see staticDetail).
+//
+// ErrVersionMismatch — AND EVERY OTHER COMPARE-AND-SET SENTINEL — IS
+// DELIBERATELY ABSENT FROM THIS FUNCTION, because the 409 it earns cannot be
+// built from the error alone: `precondition_failed` echoes the value the
+// REQUEST guarded on, and this function is handed an error and nothing else.
+// So an operation that publishes `expected_version` (or `expected_status`, or
+// `expected_assignee`) MUST match the sentinel TYPED in its own failure path,
+// before anything reaches failErr — updateIssue, closeIssue, reopenIssue,
+// deleteIssues, releaseIssue and applyBatch each do. A handler that forgets is
+// not answering a worse 4xx: neither storage leg wraps these in ErrValidation,
+// so the miss falls through the default arm below and every guard failure on
+// that operation is a GENERIC 500. Mutation-verified on the single-issue
+// handlers.
+//
+// THE RULE IS WRITTEN HERE BECAUSE SIX HANDLERS FOUND IT SEPARATELY. failUpdate
+// worked it out, failRelease worked it out again and called it "failUpdate's
+// hazard, in a sharper form", and the guard slice worked it out three more
+// times. Six independent discoveries of one fact are a fact nobody recorded
+// where the seventh author would look — which is here, since a handler author
+// asking "does the shared mapping cover my sentinel?" reads this function and
+// finds no row.
 func ClassifyError(err error) Result {
+	// The one row that carries data out of the error rather than only a code.
+	// It lives HERE, in the shared mapping, rather than in the events handler:
+	// the journal read is reached from two database sources through two
+	// different plumbings, and a mapping a handler applied itself would be one
+	// `if` away from a pruned-past checkpoint arriving as a generic 500 on
+	// whichever arm forgot it.
+	var truncated *storage.EventsJournalTruncatedError
+
 	switch {
 	case err == nil:
 		return newResult(CodeInternal, "")
+
+	case errors.As(err, &truncated):
+		return EventsJournalTruncated(truncated)
 
 	// Not-found normalization belongs in the shared read path, which folds the
 	// two miss shapes (a wrapped sql.ErrNoRows, and a nil issue with a nil

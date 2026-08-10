@@ -74,6 +74,9 @@ func TestLifecycleCloseReopenContract(t *testing.T) {
 	t.Run("CloseSettlesTheClosedRowItselfAndItsChild", func(t *testing.T) {
 		conformance.RunLifecycleCloseSettlesTheClosedRowItselfAndItsChild(t, ctx, fixture)
 	})
+	t.Run("CloseOnASpawnersLastChildSatisfiesAWaitsForGate", func(t *testing.T) {
+		conformance.RunLifecycleCloseOnASpawnersLastChildSatisfiesAWaitsForGate(t, ctx, fixture)
+	})
 	t.Run("ReopenReblocksItsDependers", func(t *testing.T) {
 		conformance.RunLifecycleReopenReblocksItsDependers(t, ctx, fixture)
 	})
@@ -90,13 +93,14 @@ func newEmbeddedLifecycleCloseReopenFixture(t *testing.T, te *testEnv, prefix st
 	}
 	kit := newEmbeddedRoleFixtureKit(te, prefix)
 	return conformance.LifecycleCloseReopenFixture{
-		IssuePrefix:   kit.IssuePrefix,
-		Lifecycle:     lifecycle,
-		CreateIssue:   kit.CreateIssue,
-		CreateWisp:    kit.CreateWisp,
-		AddDependency: kit.AddDependency,
-		SetConfig:     kit.SetConfig,
-		QueryScalar:   kit.QueryScalar,
+		IssuePrefix:          kit.IssuePrefix,
+		Lifecycle:            lifecycle,
+		CreateIssue:          kit.CreateIssue,
+		CreateWisp:           kit.CreateWisp,
+		AddDependency:        kit.AddDependency,
+		SetConfig:            kit.SetConfig,
+		QueryScalar:          kit.QueryScalar,
+		CountHistoryMatching: kit.CountHistoryMatching,
 		// The frozen kit exposes reads only, so this is the write half of the
 		// same short-lived raw connection its QueryScalar opens, pinned for the
 		// whole script so a multi-statement seed stays in one session.

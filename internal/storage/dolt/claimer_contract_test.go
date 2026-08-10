@@ -25,6 +25,12 @@ func TestClaimerReclaimsItsOwnInProgressIssueWithoutWriting(t *testing.T) {
 	conformance.RunClaimerReclaimsItsOwnInProgressIssueWithoutWriting(t, ctx, fixture)
 }
 
+func TestClaimerReclaimsAcrossSpellingWithoutWriting(t *testing.T) {
+	fixture, ctx, cleanup := newDoltClaimerFixture(t, "clspell")
+	defer cleanup()
+	conformance.RunClaimerReclaimsAcrossSpellingWithoutWriting(t, ctx, fixture)
+}
+
 func TestClaimerAcceptsAConfiguredActiveStatusAndRefusesAConfiguredWipOne(t *testing.T) {
 	fixture, ctx, cleanup := newDoltClaimerFixture(t, "clcustom")
 	defer cleanup()
@@ -41,6 +47,18 @@ func TestClaimerRefusesABuiltInIneligibleStatusWithTheStateThatRefusedIt(t *test
 	fixture, ctx, cleanup := newDoltClaimerFixture(t, "clstatus")
 	defer cleanup()
 	conformance.RunClaimerRefusesABuiltInIneligibleStatusWithTheStateThatRefusedIt(t, ctx, fixture)
+}
+
+func TestClaimerGrantsALiveLeaseOnTheRowItWonAndLeavesARefusedOneAlone(t *testing.T) {
+	fixture, ctx, cleanup := newDoltClaimerFixture(t, "cllease")
+	defer cleanup()
+	conformance.RunClaimerGrantsALiveLeaseOnTheRowItWonAndLeavesARefusedOneAlone(t, ctx, fixture)
+}
+
+func TestClaimerStampsStartedAtOnceAcrossTheTwoWritesItChoosesBetween(t *testing.T) {
+	fixture, ctx, cleanup := newDoltClaimerFixture(t, "clstart")
+	defer cleanup()
+	conformance.RunClaimerStampsStartedAtOnceAcrossTheTwoWritesItChoosesBetween(t, ctx, fixture)
 }
 
 func TestClaimerRefusesAWispIDAsNotFound(t *testing.T) {
