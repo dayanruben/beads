@@ -386,6 +386,36 @@ func TestSpecDefaultsMatchSharedConstants(t *testing.T) {
 			t.Errorf("%s: limit description does not document the non-loopback refusal of limit=0", tc.opID)
 		}
 	}
+
+	// The anchor bound on ALL THREE dependency-collection reads. Each bounds
+	// the same thing — how many issues one call may ask about — from the same
+	// maxDependencyAnchors, and each says so in prose. Nothing kept the
+	// document's number and the constant together until this: the bound is
+	// enforced in the handler, so a spec that drifted to a different maxItems
+	// would be refused by the server it documents, at a number no reader could
+	// have predicted.
+	//
+	// THE THIRD ROW IS THE POINT. listBlockingAnnotations enforces the same
+	// constant (blocking.go) and declares the same maxItems, and it predates
+	// this gate — so a two-operation loop would have pinned the copies that
+	// happened to be in the slice that wrote it and left the oldest one free
+	// to drift. Every operation reading maxDependencyAnchors belongs here, and
+	// the next one to do so must be added.
+	for _, opID := range []string{OpListDependencies, OpCountDependencyEdges, OpListBlockingAnnotations} {
+		so, ok := ops[opID]
+		if !ok {
+			t.Fatalf("operation %q missing from the spec", opID)
+		}
+		schema := mapAt(t, specParam(t, so, "issue_id"), "schema")
+		if got, ok := schema["maxItems"].(int); !ok || got != maxDependencyAnchors {
+			t.Errorf("%s: issue_id maxItems = %v, want the shared bound %d", opID, schema["maxItems"], maxDependencyAnchors)
+		}
+		// At least one is required on both, and the schema is where a
+		// generated client learns it.
+		if got, ok := schema["minItems"].(int); !ok || got != 1 {
+			t.Errorf("%s: issue_id minItems = %v, want 1", opID, schema["minItems"])
+		}
+	}
 }
 
 // capabilityToken matches one backticked capability token in the
@@ -879,9 +909,17 @@ func TestClaimNextRequestMembersMatchTheHandler(t *testing.T) {
 // admit one set: a claim answering a different question than the listing shows
 // would hand an agent work the listing never offered it.
 //
-// `limit` is the one deliberate difference, and it is asserted as an absence
-// rather than merely not listed, because it is the parameter this operation
-// refuses BY VALUE.
+// The deliberate differences are the listing's own PAGE knobs, which are not
+// filters: they bound or shape what one request returns rather than selecting
+// which rows are eligible, so a claim has no use for them.
+// issueops.ValidateClaimNextRequest refuses each one by VALUE, and because
+// readyFilters does not decode them, the HTTP door refuses them earlier still
+// as an unknown parameter. Each is asserted as an absence from claimNext rather
+// than merely left off the comparison, because a documented parameter that is
+// always a 400 is a trap either way.
+//
+// `sort` is deliberately NOT on that list. It picks WHICH row comes first, so
+// it changes which one a claim takes, and both operations must admit it.
 func TestClaimNextAdmitsExactlyTheListingsFilters(t *testing.T) {
 	doc := loadSpec(t)
 	names := func(path, method string) map[string]bool {
@@ -898,10 +936,19 @@ func TestClaimNextAdmitsExactlyTheListingsFilters(t *testing.T) {
 	listing := names("/v0/beads/ready", "get")
 	claimNext := names("/v0/beads/issues:claimNext", "post")
 
-	if !listing["limit"] {
-		t.Fatal("the listing no longer publishes `limit`; this test's one exception is stale")
+	pageKnobs := map[string]string{
+		"limit": "bounds the page; a claim takes one row however large the pool it scanned",
+		"brief": "projects the rows a page returns; a claim refetches its winning row whole, so there is nothing to project",
 	}
-	delete(listing, "limit")
+	for name, why := range pageKnobs {
+		if !listing[name] {
+			t.Fatalf("the listing no longer publishes `%s`; this test's exception for it is stale (%s)", name, why)
+		}
+		delete(listing, name)
+		if claimNext[name] {
+			t.Errorf("claimNext publishes `%s`; it refuses one by value (%s), and a documented parameter that is always a 400 is a trap", name, why)
+		}
+	}
 
 	if extra := diff(claimNext, listing); len(extra) > 0 {
 		t.Errorf("claimNext publishes parameters the ready listing does not: %v\n"+
@@ -909,10 +956,8 @@ func TestClaimNextAdmitsExactlyTheListingsFilters(t *testing.T) {
 	}
 	if missing := diff(listing, claimNext); len(missing) > 0 {
 		t.Errorf("the ready listing publishes parameters claimNext does not: %v\n"+
-			"the handler decodes them through readyFilters either way, so the document is understating what it accepts", missing)
-	}
-	if claimNext["limit"] {
-		t.Error("claimNext publishes `limit`; it refuses one, and a documented parameter that is always a 400 is a trap")
+			"the handler decodes them through readyFilters either way, so the document is understating what it accepts.\n"+
+			"If one of these is a page knob rather than a filter, add it to pageKnobs above with its reason", missing)
 	}
 }
 
@@ -1476,4 +1521,77 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestSpecSecurityMatchesRouteTable is the auth half of route/spec parity: an
+// operation declares the bearer scheme in the document exactly when its route
+// row is not auth-exempt. Without this the exemption column and the document's
+// `security` blocks are two independent statements about the same thing, and
+// the one clients read could quietly become the wrong one.
+//
+// Authentication is a DEPLOYMENT posture — a server started with no token file
+// never emits a 401 — so the spec's job here is to say which operations are
+// guarded when it is enabled, not to claim it always is. The scheme is declared
+// per operation rather than at the document level for the same reason the
+// exemption is a route-table column: healthz is exempt, and a top-level
+// `security` block with a per-operation override would state that twice.
+func TestSpecSecurityMatchesRouteTable(t *testing.T) {
+	doc := loadSpec(t)
+	ops := specOps(t, doc)
+
+	schemes := mapAt(t, mapAt(t, doc, "components"), "securitySchemes")
+	bearer := mapAt(t, schemes, specBearerScheme)
+	if got, _ := bearer["type"].(string); got != "http" {
+		t.Errorf("securityScheme %s type = %q, want http", specBearerScheme, got)
+	}
+	if got, _ := bearer["scheme"].(string); got != "bearer" {
+		t.Errorf("securityScheme %s scheme = %q, want bearer", specBearerScheme, got)
+	}
+	if _, ok := doc["security"]; ok {
+		t.Error("the document declares a top-level `security` block; the exemption is per operation, so declaring it globally states the policy twice")
+	}
+
+	for _, rt := range routeTable {
+		so, ok := ops[rt.op]
+		if !ok {
+			t.Errorf("route %q is not in the spec", rt.op)
+			continue
+		}
+		declared := specDeclaresBearer(t, so)
+		if rt.authExempt && declared {
+			t.Errorf("%s is auth-exempt in the route table but declares %s in the spec", rt.op, specBearerScheme)
+		}
+		if !rt.authExempt && !declared {
+			t.Errorf("%s is guarded by the route table but declares no security in the spec", rt.op)
+		}
+
+		// And the 401 travels with the declaration, so a generated client of a
+		// guarded operation always has the status in its response set.
+		_, has401 := mapAt(t, so.op, "responses")["401"]
+		if declared != has401 {
+			t.Errorf("%s declares security = %v but documents a 401 = %v; the two must move together", rt.op, declared, has401)
+		}
+	}
+}
+
+func specDeclaresBearer(t *testing.T, so specOp) bool {
+	t.Helper()
+	raw, ok := so.op["security"]
+	if !ok {
+		return false
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("%s: security is %T, want a sequence", so.path, raw)
+	}
+	for _, item := range list {
+		req, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("%s: security item is %T, want a mapping", so.path, item)
+		}
+		if _, ok := req[specBearerScheme]; ok {
+			return true
+		}
+	}
+	return false
 }

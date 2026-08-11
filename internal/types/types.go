@@ -79,7 +79,9 @@ type Issue struct {
 	// signals the row was mutated since you read it. It is json:"-" on purpose:
 	// row_lock is random per write, so generic Issue serialization would break
 	// stable list/export round-trips. The detail-view DTO projects it explicitly
-	// as `revision` for guarded clients; Go consumers read RowVersion directly.
+	// as `revision` for guarded clients (IssueDetails.Revision, set by
+	// NewIssueDetails, and on the wire at GET /v0/beads/issues/{id}); Go
+	// consumers read RowVersion directly.
 	//
 	// Coverage is deliberately partial: it changes on claim/close/unclaim and the
 	// generic update path, but NOT on direct-UPDATE paths that rewrite text
@@ -1138,6 +1140,39 @@ type IssueDetails struct {
 	EpicTotalChildren  *int  `json:"epic_total_children,omitempty"`
 	EpicClosedChildren *int  `json:"epic_closed_children,omitempty"`
 	EpicCloseable      *bool `json:"epic_closeable,omitempty"`
+
+	// Revision is the detail view's projection of the embedded Issue's
+	// RowVersion under a storage-neutral wire name, and it is the ONE place
+	// the token is published to a client. Read RowVersion's doc for what the
+	// token means: it is EQUALITY-ONLY, its coverage is deliberately PARTIAL,
+	// and 0 is a real value rather than an absence.
+	//
+	// It exists as a projected field rather than a re-tagged RowVersion
+	// because RowVersion is json:"-" for a reason that still holds — row_lock
+	// is random per write, so serializing it generically would break stable
+	// list and export round-trips — and the detail view is the one shape that
+	// neither lists nor interchanges. NewIssueDetails is the only door: a
+	// literal with an unset Revision serializes a 0 that is indistinguishable
+	// from a legacy migration-0054 row, so the projection lives beside the
+	// field and not at each caller.
+	//
+	// NO omitempty. A guarded write that expects 0 matches an un-mutated
+	// legacy row and misses any current one, which is correct CAS; omitting
+	// the member would leave that client unable to read the value it must
+	// send, and would make an absent field mean either "legacy-zero" or "this
+	// producer has no token".
+	Revision int64 `json:"revision"`
+}
+
+// NewIssueDetails starts a detail view of issue with the wire-visible revision
+// token projected off the row.
+//
+// It is the only constructor: the token is a projection, not an independent
+// field, and 0 is a legal token value, so a detail view assembled by struct
+// literal would publish a silently wrong token that nothing can distinguish
+// from a right one. The caller fills in labels, edges and counts afterwards.
+func NewIssueDetails(issue Issue) *IssueDetails {
+	return &IssueDetails{Issue: issue, Revision: issue.RowVersion}
 }
 
 // DependencyType categorizes the relationship
@@ -1940,11 +1975,19 @@ type IssueFilter struct {
 	// reference columns in WHERE regardless of SELECT shape. Default false preserves
 	// today's behavior at every call site.
 	//
-	// Backend coverage: honored by the issueops-backed stores (Dolt, embedded
-	// Dolt). The proxied-server (domain/db) path does not check this field yet
-	// and always returns fully-hydrated issues with IsLitePartial=false —
-	// correct results, no lite optimization. Wiring Lite through domain/db is
-	// deferred to the CLI-wiring follow-up. See engdocs/EXTENDING.md.
+	// Backend coverage: honored on BOTH stacks for the COUNTED page, which is
+	// every read that returns IssueWithCounts — issueops.Reader.List on either
+	// implementation, and so `bd list --json` on both routes and
+	// GET /v0/beads/issues. It rides the counts mega-query as
+	// sqlbuild.CountsHydration.Lite, which both seams derive from this field
+	// through their hydrationFor helper.
+	//
+	// The UNCOUNTED search is store-backed only: SearchIssuesInTx selects
+	// issueLiteProjection from this field, and the domain/db SearchIssues has
+	// no equivalent, so a caller on that path gets correct rows fully hydrated
+	// rather than an error. That path serves the text renderings, which print
+	// no body, so the gap costs bytes off the wire and no correctness.
+	// See engdocs/EXTENDING.md.
 	Lite bool
 }
 
@@ -2081,6 +2124,19 @@ type WorkFilter struct {
 	// MaxRowsSource attributes which knob set MaxRows. Expected values:
 	// "--max-rows", "BEADS_MAX_ROWS", or "" (library users with no source).
 	MaxRowsSource string
+
+	// Lite mirrors IssueFilter.Lite for ready work: the heavy TEXT columns
+	// (description, design, acceptance_criteria, notes, payload, waiters) are
+	// not selected, and the returned issues carry IsLitePartial=true with those
+	// fields zero-valued. It bounds the SIZE of a row, never which rows match:
+	// a predicate that reads a heavy column keeps working, because WHERE is
+	// independent of the SELECT shape.
+	//
+	// Unlike IssueFilter.Lite it is honored on BOTH backends, through the
+	// counts mega-query's CountsHydration. The two knobs beside it there
+	// (SkipLabels, SkipCounts) have no WorkFilter counterpart on purpose; see
+	// issueops.readyHydrationFor.
+	Lite bool
 }
 
 // StaleFilter is used to filter stale issue queries
