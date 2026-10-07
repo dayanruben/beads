@@ -72,7 +72,7 @@ Current PR-related workflow names:
   A lane that should run and fails, is cancelled, or reports no result fails
   the gate, and so does a missing or invalid mode.
   `bazel-integration` (`bazel test //... --config=integration`, the Bazel
-  twin of `main.yml`'s Linux integration shards) is required on every PR:
+  successor of `main.yml`'s former Linux integration shards) is required on every PR:
   `pr.yml` passes `integration: "on"` (policy-pinned), so it runs in modes
   `remote` (same-repo PRs) and `fork-ro`/`fork-rw` (fork and Dependabot PRs
   while rbe-fork is open), and in mode `cache` (fork and Dependabot PRs
@@ -151,13 +151,17 @@ Current PR-related workflow names:
   Runs on pushes to `main`. Contains the main branch health checks, package
   gates, platform smoke/short coverage, embedded Dolt coverage, and promoted
   Linux no-short integration shards.
-- `.github/workflows/regression.yml`: `Regression Tests`
-  Runs on `pull_request`, `push` to `main`, and manual dispatch. Does not
-  currently run on `merge_group`. Uses job-level conditional regression
-  execution.
-- `.github/workflows/cross-version-smoke.yml`: `Cross-Version Smoke Tests`
-  Runs on every PR to `main`, tag pushes, and manual dispatch. Does not
-  currently run on `merge_group`.
+- The differential regression suite (`tests/regression`, formerly
+  `regression.yml`) is `//tests/regression:regression_test`, tagged
+  `dolt-server-cmd`, so `bazel.yml`'s `bazel-cmd-dolt` lane runs it on every
+  PR, merge group and push to `main` (results cached until its inputs
+  change), against the catalog-pinned `@bd_releases//:v0.49.6` baseline and
+  a hermetic dolt sql-server.
+- The upgrade smoke tests (`scripts/upgrade-smoke-test.sh`, formerly
+  `cross-version-smoke.yml`) are `//tests/upgrade_smoke:upgrade_smoke_<release>_test`,
+  one per release in the newest 30 the release catalog pins, which
+  `bazel.yml`'s `bazel-test` lane runs on every PR, merge group and push to
+  `main` (cached until their inputs change).
 - `.github/workflows/nix-build.yml`: `nix build`
   Uses workflow-level `paths` filters on `pull_request` and `push`. This
   workflow must not be directly required.
@@ -337,8 +341,8 @@ PR. It runs in the default branch's cache scope, which `push` runs on
     binaries);
   - the `beads-go-build-v2-*` GOCACHE entries restored by `main.yml` and
     `pr.yml`;
-  - the executables in `smoke-binaries-*`, `historical-dolt-*` and
-    `regression-baseline-*`.
+  - the executables in `smoke-binaries-*` and `historical-dolt-*` (both
+    retired with their workflows).
 
   GitHub's read-only default covers all of them. Hardening `release.yml`
   with `cache: false` is tracked separately.
@@ -630,11 +634,9 @@ would only be needed if maintainers still want exactly one required check.
 Do not require these existing check names directly:
 
 - `Detect CI tier`
-- `Fast checks (build tags, versions, migrations, beads diff, fmt)` (F7a fold
-  of the former standalone `Check build-tag policy`, `Check version
-  consistency`, `Check for .beads changes` and `Check formatting` checks into
-  one job's steps; see
-  [F7a: Same-Repo Blacksmith Moves and Job Folds](#f7a-same-repo-blacksmith-moves-and-job-folds))
+- `Fast checks (frozen migrations, .beads diff)` (the base-diff checks; the
+  tree checks it used to run are Bazel tests, see
+  [Repository Guards as Bazel Tests](#repository-guards-as-bazel-tests))
 - `Check pure-Go and js/wasm boundaries (CGO_ENABLED=0)`
 - `Check doc flags freshness`
 - `Check release target cross-compilation (unix)` and `(desktop)` (F7a fold
@@ -646,8 +648,7 @@ Do not require these existing check names directly:
 - `Test (ubuntu-latest)`
 - `Test (macos-latest)`
 - `Test (storage domain + uow)`
-- `Test (Dolt server fingerprint)`
-- `Go checks (scripts-test)`, `Go checks (vet)` and `Go checks (allowlisted)`
+- `Go checks (vet)`
 - `Contract corpus (golden + determinism + conformance)`
 - `PR Core (wrapper timing)`
 - `Build Artifacts`
@@ -662,11 +663,6 @@ Do not require these existing check names directly:
 - `Test (Windows - smoke)`
 - `PR Lint (native)`, `PR Lint (windows)` and `PR Lint (darwin)`
 - `Test Nix Flake`
-- `Differential Regression (v0.49.6 baseline)`
-- `Upgrade smoke (chunk N)` (F7c: folded from one job per version into one job
-  per 5-version chunk; still never require a matrix-expanded chunk job
-  directly)
-- `Resolve versions to test`
 - `Bazel / test` and the other jobs of `bazel.yml`
 - `Bazel Farm / *` (`bazel-farm.yml`'s advisory, PR-controlled results)
 
@@ -920,35 +916,42 @@ manifests. On those PRs they are the tiers' only pre-merge run, and
     timing measured there), `ubuntu-latest` otherwise. `bazel-test`'s own
     `bazel-ci-build-artifacts` upload is no longer consumed by anything; it
     is kept for the F3.5.3 SHA256SUMS comparison and for debugging.
-  - Kept on every PR: the Dolt server fingerprint (container image vs the
-    pinned dolt CLI the Bazel dolt-server lanes start), formerly
-    `test-domain-uow`'s first step, is its own required job
-    `test-dolt-server-fingerprint` (`Test (Dolt server fingerprint)`,
-    `TEST_DOLT_SERVER_FINGERPRINT`). `check-release-target-cross-compilation`
+  - The Dolt server fingerprint is checked per backend, where that backend
+    runs. The local server (the pinned dolt CLI every Bazel dolt-server lane
+    starts) is checked by `//internal/testutil:testutil_dolt_test` on the
+    dolt-server lane. The container is checked by `test-domain-uow`'s first
+    test step, which runs only where the container-backed jobs run (not
+    covered by `pr_lanes`). The every-PR job `test-dolt-server-fingerprint`
+    (`Test (Dolt server fingerprint)`, `TEST_DOLT_SERVER_FINGERPRINT`)
+    pulled a docker image the workers do not have, so it is retired; the
+    image tag stays pinned to the dolt release by
+    `TestPinnedDoltCLIMatchesContainerImage`. `check-release-target-cross-compilation`
     still `go build`s `./...` with `CGO_ENABLED=0` on every PR.
   - Also kept on every PR, in the required job `scripts-go-checks`
-    (`SCRIPTS_GO_CHECKS`; PR Core's environment: dolt, git and dolt
-    identity, `scripts/ci/lib/test-env.sh`):
-    - `go test ./scripts/...` with PR Core's flags
-      (`scripts/ci/scripts-go-test.sh`). The repository policy tests,
-      including the D2 guards, check part or all of their rules under
-      `go test` only (their inputs are not in `//scripts:scripts_test`'s
-      runfiles), so without this they would have no required pre-merge run
-      on covered PRs.
-    - `go test`'s own vet checks (cmd/go's `defaultVetFlags`, policy-tested
-      equal to the toolchain's) over `./...` (`scripts/ci/go-test-vet.sh`):
-      rules_go's `go_test` runs no vet, so a `go test` vet finding would
-      otherwise first fail on `main` and then on every fork PR.
-    - the Go tests `bazel test --config=ci` does not run or skips
-      (`tools/bazel/equivalence_allowlist.txt`), under `go test`
-      (`scripts/ci/allowlisted-go-tests.sh`); each entry must match a test
-      that ran and passed.
+    (`SCRIPTS_GO_CHECKS`, one leg, `Go checks (vet)`): `go test`'s own vet
+    checks (cmd/go's `defaultVetFlags`, policy-tested equal to the
+    toolchain's) over `./...` (`scripts/ci/go-test-vet.sh`): rules_go's
+    `go_test` runs no vet, so a `go test` vet finding would otherwise first
+    fail on `main` and then on every fork PR.
+  - The repository policy tests (`./scripts/...`, including the D2 guards)
+    and the tests that walk the checkout run only under Bazel, remotely:
+    `//scripts:scripts_test` and `//test/docsync:docsync_test` take
+    `//:repo_files` as data, the checkout as Bazel sees it (every tracked
+    file outside `.bazelignore`, aggregated from the `repo_files` block
+    `tools/bazel/go_srcs.py` keeps in every package; the BUILD sync step's
+    `make bazel-sync-check` fails on a package without it). The release
+    formula under `.bazelignore`d `.beads/` comes in as `@beads_formulas`.
+    Their former `go test` legs (`Go checks (scripts-test)` and
+    `Go checks (allowlisted)`) are gone.
 
-    `TestBazelOnlySkipsAreAllowlisted` (itself go-test-only, so in that
-    job) requires every top-level test with a `TEST_SRCDIR`- or
+    `tools/bazel/equivalence_allowlist.txt` holds only the two `cmd/bd`
+    tests of plain `go test`'s own bd build fallback, which Bazel never
+    takes; `pr-preflight-platforms` runs them on every OS ("Exercise go
+    test's bd build fallback"). `TestBazelOnlySkipsAreAllowlisted` (under
+    Bazel too) requires every top-level test with a `TEST_SRCDIR`- or
     `bazeltest.IsBazel()`-guarded `t.Skip` to have an allowlist `skip`
-    entry, and every test that runs part of its checks under `go test`
-    only to live under `./scripts`.
+    entry, and no test anywhere to run part of its checks under `go test`
+    only.
   - Package gates on a covered PR in a non-remote mode (the farm switch off)
     fail in their own "Check the Bazel-built bd exists" step, naming
     `BAZEL_PR_LANES_RETIRED`, instead of on a missing artifact.
@@ -998,7 +1001,8 @@ manifests. On those PRs they are the tiers' only pre-merge run, and
   policy-tested) is `"true"`: their lanes then run remotely through
   rbe-fork (modes `fork-ro`/`fork-rw`), and a run rbe-fork does not serve
   (mode `cache`) turns `CI Gate / Required` red rather than falling back.
-  It ships `"false"`.
+  It is `"true"` (ga-96smfk.15): fork and Dependabot PRs run only the Bazel
+  lanes for the retired tiers.
 - Everyone else keeps the legacy tiers unchanged:
   - fork PRs, while `BAZEL_COVERS_FORKS` is `"false"` (their Bazel lanes
     run beside the legacy tiers: remotely while rbe-fork is open, else in
@@ -1015,7 +1019,9 @@ manifests. On those PRs they are the tiers' only pre-merge run, and
   only run of each retired tier and `CI Gate / Required` is red unless they
   ran remotely and passed (see [Merge Queue](#merge-queue)).
 
-  `main.yml`'s embedded and proxied jobs on push to `main` are untouched.
+  On push to `main`, `bazel.yml`'s push run is the only run of these tiers
+  (`main.yml`'s legacy embedded, proxied, integration, domain+uow and Linux
+  unit jobs were removed, ga-96smfk.14).
 - How:
   - `pr-risk.yml` and `pr.yml` each run the identical `bazel-coverage` job
     (policy-tested). The job does no checkout and runs no repository code.
@@ -1076,9 +1082,8 @@ manifests. On those PRs they are the tiers' only pre-merge run, and
   default branch (`main`) only. On PRs into `release/**` both workflows run
   and report, but merging does not wait for them, before or after this
   change. Without the merge queue rule and with `strict` off, no
-  pre-merge run catches a gap; only `main.yml`'s embedded and proxied jobs
-  and `bazel.yml`'s push run do, after merge (`main.yml` has no server-Dolt
-  storage jobs; `bazel.yml`'s push run covers that tier).
+  pre-merge run catches a gap; only `bazel.yml`'s push run does, after
+  merge.
 - Lane hardening that the retirement relies on, for `bazel-embedded`,
   `bazel-proxied` and `bazel-server-storage` alike (policy-tested in
   `scripts/ci_workflow_test.go` and `scripts/pr_risk_bazel_coverage_test.go`):
@@ -1148,10 +1153,19 @@ manifests. On those PRs they are the tiers' only pre-merge run, and
   - Verified on a real remote run before step 2 (2026-10-01): proxied 164
     top-level tests over 15 shards, 0 skipped; server storage 1246 + 1
     conformance, 10 skipped (none all-skipped); both checkers pass.
-- Not changed: `conformance.yml`'s Tier 1 (`scripts/conformance.sh`) runs the
-  embedded-Dolt `TestConformance` again (non-race, unsharded), duplicating
-  `test-embedded-conformance` and the Bazel lane. It is not part of either
-  required gate; retiring it is a separate decision.
+- `conformance.yml` is retired. Its Tier 1 (the embedded-Dolt
+  `TestConformance`) duplicated `test-embedded-conformance` and the
+  embedded lane's `embeddeddolt_conformance_{core,audit}_test`; its Tier 2
+  (the real-binary CLI corpus, `go test -tags 'gms_pure_go e2e'
+  ./test/conformance`) is `//test/conformance:conformance_test` against the
+  injected non-race `bd_for_tests`. Its files build under `e2e ||
+  integration`, so it is `integration-only` and `--config=integration` runs
+  it in `bazel-integration`, which `pr.yml`'s gate requires (PR Core's `go
+  test` builds neither tag). Neither tier was part of a required gate
+  before. `scripts/conformance.sh` stays as the local `go test` entrypoint.
+  `docs-mintlify.yml` likewise drops its docsync job (`go test
+  ./test/docsync`, which `bazel-test` runs as `//test/docsync:docsync_test`)
+  and keeps only Mintlify's network-bound broken-link check.
 
 ### F7a: Same-Repo Blacksmith Moves and Job Folds
 
@@ -1169,8 +1183,9 @@ scope, not this slice's.
   `TestSameRepoBlacksmithRunners` and `TestSameRepoBlacksmithExpressionSemantics`
   in `scripts/ci_workflow_test.go`): pr.yml's `fast-checks`,
   `advisory-reports`, `check-release-target-cross-compilation` (8 vCPU),
-  `check-doc-flags` (4 vCPU), `pr-policy-wrapper` (4 vCPU),
-  `test-dolt-server-fingerprint`; pr-risk.yml's `test-nix` (4 vCPU). Every
+  `check-doc-flags` (4 vCPU), `pr-policy-wrapper` (4 vCPU)
+  (and `test-dolt-server-fingerprint`, since retired); pr-risk.yml's
+  `test-nix` (4 vCPU). Every
   other job keeps the default 2 vCPU label. Forks and Dependabot PRs fall back
   to `ubuntu-latest`, as F3's `bazel-coverage`/`ci-gate`/`detect-ci-tier` jobs
   and bazel.yml's `rbe` job already do; `TestBlacksmithJobsReadNoSecrets`
@@ -1237,6 +1252,49 @@ scope, not this slice's.
   Windows job to Blacksmith (there is no Windows Blacksmith pool), and
   neither job is one F4's concurrent Windows-region edits touch.
 
+### Repository Guards as Bazel Tests
+
+ga-96smfk.20 moved the repository guards that pr.yml ran on GitHub runners
+into Bazel tests over narrow slices of the checkout
+(`tools/bazel/repo_subset.bzl`, laid out as a throwaway git checkout by
+`scripts/repochecks/run_check.sh`), so they run remotely in bazel.yml's
+`test` lane and a pass is reused until one of the files the guard reads
+changes. They gate through `BAZEL_TEST`; pinned by
+`TestPRPolicyChecksRunAsBazelTargets`.
+
+| Former job / step | Bazel target |
+| --- | --- |
+| fast-checks: `check-build-tags.sh` | `//scripts/repochecks:build_tags_test` |
+| fast-checks: `check-go-install-guidance.sh` | `//scripts/repochecks:go_install_guidance_test` |
+| fast-checks: `check-winget-portable-alias.sh` | `//scripts/repochecks:winget_portable_alias_test` |
+| fast-checks: `check-versions.sh` | `//internal/versioncheck:versioncheck_test` (same `versioncheck.Check` over the release metadata) |
+| fast-checks: migration hygiene checks A and B | `//scripts/repochecks:migration_hygiene_test` (`MIGRATION_HYGIENE_SCOPE=tree`) |
+| fast-checks: `make fmt-check` | `//scripts/repochecks:fmt_test` (the registered SDK's gofmt) |
+| PR Policy: `checkworkflowtags` | `//scripts/repochecks:workflow_tags_test` |
+| PR Policy: `check-testing-short.sh` | `//scripts:scripts_test` (`TestCheckTestingShortPassesOnCleanRepoTree`) |
+| PR Policy: workapi frontend boundary | `//scripts/repochecks:workapi_frontend_boundary_test` |
+| PR Policy: `make api-check` drift | `//scripts/repochecks:types_gen_drift_test`; its `go test ./internal/httpapi/...` half is the httpapi targets in the same lane |
+| PR Policy / check-doc-flags: `check-doc-freshness.sh` | `//scripts/repochecks:doc_freshness_test` |
+| check-doc-freshness-platforms, Linux leg | `//scripts:doc_freshness_required_test` (integration lane) and `//scripts/gitattributespolicy:gitattributespolicy_required_host_test` |
+
+What stays a job, and why:
+
+- `fast-checks` keeps the two checks that need the PR's base commit:
+  check-migration-hygiene.sh's delta half (`MIGRATION_HYGIENE_SCOPE=delta`:
+  frozen shipped migrations, ignored-plane twins, prepared DML in new
+  migrations) and the `.beads/issues.jsonl` guard. No action key can hold a
+  base commit.
+- `check-doc-flags` validates the generated CLI docs against bd built from
+  the release tag in `docs/cli-docs.pin` (git fetch plus a pure-Go
+  `go build`), and attributes drift against the merge-base. Releases publish
+  no pure-Go Linux binary a Bazel repository could pin by sha256.
+- The macOS and Windows legs of `check-doc-freshness-platforms` (no remote
+  workers for those hosts), on Blacksmith for same-repo PRs and merge groups.
+
+`check-doc-freshness.sh` compares review dates with today's date, which is
+not in the action key: a cached pass stands until one of its inputs changes,
+and nightly's `--config=fresh` run re-checks it against the date.
+
 ### Same-Repo Blacksmith macOS Legs
 
 pr.yml's two mixed-OS matrix jobs, `pr-preflight-platforms` and
@@ -1259,8 +1317,10 @@ macOS jobs; `release.yml`, `nightly.yml` and `ci-measurements.yml` stay on
   main.yml's `blacksmith-macos-go-build-cache` job is their seeder: same
   label, push-to-main-only job guard, module cache plus a non-race GOCACHE
   keyed by `go.sum` and UTC day, warmed by the shared
-  `scripts/ci/warm-non-race-cache.sh`. main.yml's `test` job macOS leg (the
-  GitHub-hosted full suite) is unchanged and still seeds the fork path.
+  `scripts/ci/warm-non-race-cache.sh`. Its `github` venue leg seeds the
+  fork path (`macos-latest`) the same way; main.yml's `test` job (the macOS
+  full suite) runs on the same Blacksmith label and restores the Blacksmith
+  leg's caches.
 - **Pins.** `TestSameRepoPlatformsMatrixMarkerRunsOnExpressionSemantics`,
   `TestBlacksmithMacOSSaverMatchesPRLegs`,
   `TestBlacksmithSaverJobsGuardedAgainstPullRequest`,
@@ -1296,20 +1356,16 @@ tier down in the same workflow:
 
 ### Regression Tests
 
-`Regression Tests` can stay visible as a non-required workflow. If regression
-becomes branch-protection relevant, do not require
-`Differential Regression (v0.49.6 baseline)` directly.
-
-Use one of these narrow changes instead:
-
-1. Move the regression detector and regression job into the required PR
-   topology, wire them into the relevant aggregate gate, and add `merge_group`
-   behavior that defaults to running regression.
-2. Keep `regression.yml` separate, remove any workflow-level skip filters, add
-   `merge_group`, add a final `Regression Gate / Informational` aggregate, and
-   leave it non-required unless branch protection is intentionally expanded.
-
-The preferred required-check topology keeps only aggregate gates required.
+`regression.yml` is retired. The suite runs as
+`//tests/regression:regression_test` (8 shards) in `bazel.yml`'s
+`bazel-cmd-dolt` lane, which `pr.yml`'s `CI Gate / Required` requires
+(`BAZEL_CMD_DOLT_REQUIRED`), so regression is now part of the aggregate gate
+on PRs and merge groups instead of a separate, path-detected advisory
+workflow. Its path detector is replaced by test result caching: the target
+re-runs only when `bd_for_tests`, the suite or its pinned inputs change. The
+baseline is `@bd_releases//:<BASELINE_VERSION>` (`tools/bazel/bd_releases.bzl`,
+pinned by `scripts/migration-test/release-catalog.json`); `TestMain` fails if
+the binary does not report `BASELINE_VERSION`.
 
 ### Nix Build
 
@@ -1329,13 +1385,14 @@ PRs that don't touch Nix or Go module files.
 
 ### Cross-Version Smoke
 
-`Cross-Version Smoke Tests` should remain non-required for ordinary PRs unless
-maintainers explicitly choose to pay that cost in the aggregate gate. If it
-becomes required, add `merge_group` and put it behind a detector plus aggregate
-inside the required topology. Do not require matrix-expanded
-`Upgrade smoke (chunk N)` jobs directly (F7c folded the old one-job-per-version
-matrix into one job per 5-version chunk; the per-chunk job name changed but
-the "do not require individually" guidance is unchanged).
+`cross-version-smoke.yml` is retired. Its suite runs as
+`//tests/upgrade_smoke/...` inside `bazel-test`, which `CI Gate / Required`
+requires, so it now gates PRs and merge groups through the aggregate. Each
+target pins its previous release from the release catalog (`@bd_releases`)
+instead of resolving `gh release list` at run time, so the tested set is
+reviewed: the newest 30 stable releases with a linux/amd64 asset, where the
+workflow tested the newest 5 GitHub releases (prereleases included) on PRs
+and 30 on tag pushes.
 
 ## Merge Queue
 
@@ -1470,12 +1527,12 @@ check read.
 
 Non-Bazel required jobs re-run in full on every merge group (approximate
 PR timings, 2026-10): `fast-checks` (~40 s), `pr-policy-wrapper`
-(~2.5 min), `scripts-go-checks` (3 legs, up to ~3.5 min), `pr-lint-wrapper`
+(~2.5 min), `scripts-go-checks` (vet only), `pr-lint-wrapper`
 (native/darwin/windows, up to ~4 min), `check-doc-flags` (~1.7 min),
 `check-doc-freshness-platforms` and `pr-preflight-platforms` (Linux,
 Windows and macOS legs, up to ~5 min on Windows),
 `check-release-target-cross-compilation` (~5 min),
-`test-dolt-server-fingerprint` (~1 min), `windows-make-shell` (~2.7 min),
+`windows-make-shell` (~2.7 min),
 `windows-test-binaries` plus the prebuilt Windows pair (~7 min end to
 end), the advisory native Windows pair (~5 min; the gate waits for them),
 `test-nix` (~3 min) and the package gates (seconds unless their paths
