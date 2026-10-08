@@ -826,7 +826,6 @@ var allowedBazelTestTags = map[string]string{
 	"host-tools":      "needs host tools (bash/git/make/jq/...) beyond the test wrapper's",
 	"no-remote-exec":  "must run on the Bazel client's host, never on a remote worker",
 	"no-remote-cache": "result depends on the host, so it is neither read from nor uploaded to the remote cache",
-	"requires-docker": "needs a docker daemon; excluded from --config=prcore/ci, run by --config=docker",
 	// No no-remote-exec: the target starts its own dolt sql-server from the
 	// pinned dolt in its runfiles, so it runs on any worker, and a server that
 	// cannot start fails it rather than skipping, so its cached result holds.
@@ -852,6 +851,12 @@ var allowedBazelTestTags = map[string]string{
 	// integration tag, as releases are, and running it again under the
 	// integration build would only repeat it against a test-shaped bd.
 	"pr-core-only": "runs only in --config=prcore/ci; excluded from --config=integration",
+	// For a go_binary whose every source file is `//go:build cgo`: it also
+	// sets target_compatible_with incompatible under //tools/bazel:pure, and
+	// tools/bazel/go_srcs.py and scripts/ci/bazel-release-cross-compile.sh
+	// leave it out of //tools/bazel:release_cross by this tag (`go build
+	// ./...` skips the package with CGO_ENABLED=0).
+	"cgo-only": "a go_binary with only cgo sources: incompatible with pure builds and left out of //tools/bazel:release_cross",
 }
 
 // bazelPRCoreExcludedTags are the tags whose targets never run in the PR-core
@@ -860,7 +865,7 @@ var allowedBazelTestTags = map[string]string{
 // and vice versa (TestBazelPRCoreExcludedTagsMatchTaxonomy), so a new lane
 // tag lands here, and through bazelIntegrationExcludedTags in the
 // integration lane's filter too.
-var bazelPRCoreExcludedTags = []string{"requires-docker", "dolt-server", "dolt-server-proxied", "dolt-server-integration", "dolt-server-cmd", "embedded", "manual", "integration-only"}
+var bazelPRCoreExcludedTags = []string{"dolt-server", "dolt-server-proxied", "dolt-server-integration", "dolt-server-cmd", "embedded", "manual", "integration-only"}
 
 // bazelIntegrationRunsTags are the PR-core-excluded tags --config=integration
 // runs: the integration lane is main.yml's integration jobs, whose
@@ -908,12 +913,9 @@ func TestBazelPRCoreExcludedTagsMatchTaxonomy(t *testing.T) {
 // they must also carry: no-remote-exec, or remote execution would run them on a
 // worker that lacks the tool or daemon; and for host-tools, no-remote-cache,
 // because the action key does not cover the host's tool inventory, so a result
-// produced on one host must not be served to another. (requires-docker
-// targets fail rather than skip without their daemon, so their passes are
-// safe to share.)
+// produced on one host must not be served to another.
 var bazelTagsRequiring = map[string][]string{
-	"host-tools":      {"no-remote-exec", "no-remote-cache"},
-	"requires-docker": {"no-remote-exec"},
+	"host-tools": {"no-remote-exec", "no-remote-cache"},
 }
 
 var (
@@ -988,8 +990,8 @@ func checkBazelBuildTags(name, build string) []error {
 
 func TestBazelTestTagsFollowTaxonomy(t *testing.T) {
 	for name, good := range map[string]string{
-		"docker": "# Tags:\n#   requires-docker: needs a daemon.\n#   no-remote-exec: the daemon is local.\n" +
-			"sh_test(\n    name = \"x\",\n    tags = [\n        \"no-remote-exec\",\n        \"requires-docker\",\n    ],\n)\n",
+		"multi-line": "# Tags:\n#   dolt-server: hermetic servers.\n#   manual: a build input.\n" +
+			"sh_test(\n    name = \"x\",\n    tags = [\n        \"dolt-server\",\n        \"manual\",\n    ],\n)\n",
 		"host-tools": "# host-tools, no-remote-exec, no-remote-cache: git.\n" +
 			"go_test(\n    name = \"x\",\n    tags = [\"host-tools\", \"no-remote-exec\", \"no-remote-cache\"],  # why\n)\n",
 	} {
@@ -1002,7 +1004,7 @@ func TestBazelTestTagsFollowTaxonomy(t *testing.T) {
 		"no comment":      "go_test(\n    name = \"x\",\n    tags = [\"manual\"],\n)\n",
 		"comment too far": "# manual: harness\n\ngo_test(\n    name = \"x\",\n    tags = [\"manual\"],\n)\n",
 		"other rule's":    "# manual: harness\ngo_test(name = \"a\", tags = [\"manual\"])\n\ngo_test(\n    name = \"b\",\n    tags = [\"manual\"],\n)\n",
-		"docker unpinned": "# requires-docker: daemon\ngo_test(\n    name = \"x\",\n    tags = [\"requires-docker\"],\n)\n",
+		"docker tag":      "# requires-docker, no-remote-exec: daemon\ngo_test(\n    name = \"x\",\n    tags = [\"requires-docker\", \"no-remote-exec\"],\n)\n",
 		"not a literal":   "# manual\ngo_test(\n    name = \"x\",\n    tags = MANUAL,\n)\n",
 		"literal plus":    "# manual\ngo_test(\n    name = \"x\",\n    tags = [\"manual\"] + MORE,\n)\n",
 		"host cacheable":  "# host-tools no-remote-exec\ngo_test(\n    name = \"x\",\n    tags = [\"host-tools\", \"no-remote-exec\"],\n)\n",
@@ -1153,13 +1155,13 @@ func TestBazelrcPrcoreExcludesNonPRTags(t *testing.T) {
 	}
 	for name, rc := range map[string]string{
 		"missing":        "test:ci --keep_going\n",
-		"no docker":      "test:prcore --test_tag_filters=-dolt-server,-embedded,-manual\n",
-		"no dolt-server": "test:prcore --test_tag_filters=-requires-docker,-embedded,-manual\n",
-		"ci override": "test:prcore --test_tag_filters=-requires-docker,-embedded,-manual\n" +
-			"test:ci --config=prcore\ntest:ci --test_tag_filters=requires-docker\n",
-		"second prcore line": "test:prcore --test_tag_filters=-requires-docker,-embedded,-manual\n" +
+		"no embedded":    "test:prcore --test_tag_filters=-dolt-server,-manual\n",
+		"no dolt-server": "test:prcore --test_tag_filters=-embedded,-manual\n",
+		"ci override": "test:prcore --test_tag_filters=-dolt-server,-embedded,-manual\n" +
+			"test:ci --config=prcore\ntest:ci --test_tag_filters=dolt-server\n",
+		"second prcore line": "test:prcore --test_tag_filters=-dolt-server,-embedded,-manual\n" +
 			"test:prcore --test_tag_filters=-manual\n",
-		"transitive": "test:prcore --test_tag_filters=-requires-docker,-embedded,-manual\n" +
+		"transitive": "test:prcore --test_tag_filters=-dolt-server,-embedded,-manual\n" +
 			"test:ci --config=prcore\nbuild:nightly --config ci --test_tag_filters=\n",
 	} {
 		if err := checkBazelrcPrcoreTagFilter(rc); err == nil {
@@ -1200,23 +1202,16 @@ func TestBazelrcPrcoreMatchesPRCoreParallel(t *testing.T) {
 	t.Fatalf(".bazelrc lacks %q (pr-core.sh runs go test -parallel %s)", want, m[1])
 }
 
-// Docker-lane results depend on host state no action key sees (daemon, dolt
-// image, network), so they must always execute, like the container jobs'
-// -count=1; and no remote-exec run may upload a locally executed result to
-// the shared cache.
-func TestBazelrcDockerLaneNeverCached(t *testing.T) {
-	lines := map[string]bool{}
+// No remote-exec run may upload a locally executed result (a no-remote-exec
+// test's, which depends on the host) to the shared cache.
+func TestBazelrcRemoteExecUploadsNoLocalResults(t *testing.T) {
+	const want = "build:remote-exec --noremote_upload_local_results"
 	for _, line := range strings.Split(readPolicyFile(t, bazelPolicyRoot(t), ".bazelrc"), "\n") {
-		lines[strings.TrimSpace(line)] = true
-	}
-	for _, want := range []string{
-		"test:docker --nocache_test_results",
-		"build:remote-exec --noremote_upload_local_results",
-	} {
-		if !lines[want] {
-			t.Errorf(".bazelrc lacks %q", want)
+		if strings.TrimSpace(line) == want {
+			return
 		}
 	}
+	t.Errorf(".bazelrc lacks %q", want)
 }
 
 // --- fork cache --------------------------------------------------------------
@@ -1518,10 +1513,11 @@ func sameTagSet(a, b map[string]bool) bool {
 }
 
 // TestBazelIntegrationLaneMatchesMainWorkflow keeps --config=integration in
-// step with the integration-tagged `go test` it replaced on push to main
-// (main.yml's former "Main Linux integration" jobs), whose one remaining Go
-// twin is nightly.yml's Full Test Suite: the same build tags, race,
-// BEADS_TEST_SKIP=dolt, and none of the variants that run does not use.
+// step with the integration-tagged `go test` it replaced (main.yml's former
+// "Main Linux integration" jobs and nightly.yml's retired Full Test Suite,
+// `go test -race -tags=integration,gms_pure_go ./...` with
+// BEADS_TEST_SKIP=dolt): the same build tags, race, BEADS_TEST_SKIP=dolt, and
+// none of the variants that run does not use.
 // It also requires gazelle to see the same tags (root BUILD.bazel
 // `gazelle:build_tags`): gazelle drops a file whose build constraint names a
 // tag it does not know, so without it no BUILD file would list the integration
@@ -1530,22 +1526,7 @@ func sameTagSet(a, b map[string]bool) bool {
 // through `make bazel-sync`, whose staleness bazel.yml already fails on.
 func TestBazelIntegrationLaneMatchesMainWorkflow(t *testing.T) {
 	root := bazelPolicyRoot(t)
-	nightly := readCIWorkflow(t, "nightly.yml").job(t, "full-test")
-	var want map[string]bool
-	for _, step := range nightly.Steps {
-		if m := regexp.MustCompile(`go test .*-race -tags=(\S+) .*-timeout=30m \./\.\.\.`).FindStringSubmatch(step.Run); m != nil {
-			if want != nil {
-				t.Fatalf("nightly.yml full-test: more than one integration `go test -race -tags=...` step")
-			}
-			want = tagSet(m[1])
-			if step.Env["BEADS_TEST_SKIP"] != "dolt" {
-				t.Fatal("nightly.yml full-test no longer runs with BEADS_TEST_SKIP=dolt; update test:integration")
-			}
-		}
-	}
-	if !want["integration"] {
-		t.Fatalf("nightly.yml full-test: want one `go test -race -tags=...integration... -timeout=30m ./...` step, got tags %v", want)
-	}
+	want := tagSet("integration,gms_pure_go")
 
 	bazelrc := readPolicyFile(t, root, ".bazelrc")
 	lines := map[string]bool{}
@@ -1558,7 +1539,7 @@ func TestBazelIntegrationLaneMatchesMainWorkflow(t *testing.T) {
 		}
 	}
 	if !sameTagSet(laneTags, want) {
-		t.Errorf(".bazelrc build:integration tags = %v, want nightly.yml full-test's %v", laneTags, want)
+		t.Errorf(".bazelrc build:integration tags = %v, want %v", laneTags, want)
 	}
 	if err := checkBazelrcIntegrationLane(bazelrc); err != nil {
 		t.Error(err)
