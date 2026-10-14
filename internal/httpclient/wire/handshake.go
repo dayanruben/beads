@@ -154,6 +154,31 @@ const CapListSort = "issues.list.sort"
 // parity gate compares this client's whole vocabulary with the server's.
 const CapCountScope = "issues.count.scope"
 
+// CapListSearch is the behavior capability announcing that listIssues honors
+// `q`, `bd search`'s free text (issueops.ListRequest.Query), spelled exactly
+// as httpapi's CapIssuesListSearch. The Reader's List reads it off the
+// handshake snapshot and refuses a request that carries Query LOCALLY, with a
+// typed capability error naming this token, when the server does not
+// advertise it — so a search never dials a server that would answer
+// `unknown_parameter`, and is never widened into the unsearched listing.
+const CapListSearch = "issues.list.search"
+
+// CapListNoAssignee, CapListTitle and CapListIDs are the behavior
+// capabilities announcing that listIssues honors `no_assignee`, `title` and the
+// repeatable `id` (`bd list --no-assignee`, `--title`, `--id`;
+// issueops.ListRequest's NoAssignee, TitleSearch and IDFilter), spelled exactly
+// as httpapi's CapIssuesListNoAssignee, CapIssuesListTitle and CapListIDs. The
+// Reader's List reads them off the handshake snapshot and refuses a request
+// carrying a member LOCALLY, with a typed capability error naming that
+// member's token, when the server does not advertise it — never a round trip
+// an older server answers `unknown_parameter`, never a wider listing than
+// asked for.
+const (
+	CapListNoAssignee = "issues.list.noAssignee"
+	CapListTitle      = "issues.list.title"
+	CapListIDs        = "issues.list.ids"
+)
+
 // CapBatchApplyLarge is the behavior capability announcing that issues.batchApply
 // accepts a batch larger than the compiled-in floor (100 items), up to the
 // raised ceiling (1000), spelled exactly as httpapi's constant of the same name
@@ -382,7 +407,8 @@ var behaviorCapabilities = []string{
 	CapProjectEnforce, CapBatchApplyLarge, CapListSort, CapCountScope,
 	CapSweepWispsPlane, CapSweepLiveDependents, CapSweepLimit,
 	CapBatchApplyDepAddLineage, CapIssuesUpdateAllowTemplate, CapIssuesCreateDefaultPriority,
-	CapCloseAutoCloseMolecule,
+	CapCloseAutoCloseMolecule, CapListSearch,
+	CapListNoAssignee, CapListTitle, CapListIDs,
 }
 
 // CapabilityFor reports the capability token gating op, and whether op is on

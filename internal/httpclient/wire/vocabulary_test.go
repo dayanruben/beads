@@ -148,6 +148,18 @@ func TestTheProjectIdentityVocabularyMatchesTheServer(t *testing.T) {
 	if CapListSort != httpapi.CapIssuesListSort {
 		t.Errorf("CapListSort = %q, server says %q", CapListSort, httpapi.CapIssuesListSort)
 	}
+	if CapListSearch != httpapi.CapIssuesListSearch {
+		t.Errorf("CapListSearch = %q, server says %q", CapListSearch, httpapi.CapIssuesListSearch)
+	}
+	if CapListNoAssignee != httpapi.CapIssuesListNoAssignee {
+		t.Errorf("CapListNoAssignee = %q, server says %q", CapListNoAssignee, httpapi.CapIssuesListNoAssignee)
+	}
+	if CapListTitle != httpapi.CapIssuesListTitle {
+		t.Errorf("CapListTitle = %q, server says %q", CapListTitle, httpapi.CapIssuesListTitle)
+	}
+	if CapListIDs != httpapi.CapListIDs {
+		t.Errorf("CapListIDs = %q, server says %q", CapListIDs, httpapi.CapListIDs)
+	}
 	if CapCountScope != httpapi.CapIssuesCountScope {
 		t.Errorf("CapCountScope = %q, server says %q", CapCountScope, httpapi.CapIssuesCountScope)
 	}
@@ -201,11 +213,13 @@ func TestTheProjectIdentityVocabularyMatchesTheServer(t *testing.T) {
 		httpapi.CapProjectEnforce, httpapi.CapBatchApplyLarge, httpapi.CapIssuesListSort, httpapi.CapIssuesCountScope,
 		httpapi.CapIssuesSweepWispsPlane, httpapi.CapIssuesSweepLiveDependents, httpapi.CapIssuesSweepLimit,
 		httpapi.CapBatchApplyDepAddLineage, httpapi.CapIssuesUpdateAllowTemplate, httpapi.CapIssuesCreateDefaultPriority,
-		httpapi.CapIssuesCloseAutoCloseMolecule,
+		httpapi.CapIssuesCloseAutoCloseMolecule, httpapi.CapIssuesListSearch,
+		httpapi.CapIssuesListNoAssignee, httpapi.CapIssuesListTitle, httpapi.CapListIDs,
 	}) {
 		t.Errorf("behaviorCapabilities = %v, want the server's project.enforce, issues.batchApplyLarge, issues.list.sort, "+
-			"issues.count.scope, issues.sweep.wispsPlane, issues.sweep.liveDependents, issues.sweep.limit and "+
-			"issues.batchApply.depAddLineage, issues.update.allowTemplate, issues.create.defaultPriority and issues.close.autoCloseMolecule tokens", behaviorCapabilities)
+			"issues.count.scope, issues.sweep.wispsPlane, issues.sweep.liveDependents, issues.sweep.limit, "+
+			"issues.batchApply.depAddLineage, issues.update.allowTemplate, issues.create.defaultPriority, issues.close.autoCloseMolecule, issues.list.search, "+
+			"issues.list.noAssignee, issues.list.title and issues.list.ids tokens", behaviorCapabilities)
 	}
 }
 
