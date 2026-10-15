@@ -166,6 +166,15 @@ const (
 // (E9-S2), adopted unchanged so the two servers publish one `id`.
 const CapListIDs = "issues.list.ids"
 
+// CapDependenciesBlockingIsBlocked is the behavior capability that advertises
+// GET /v0/beads/dependencies/blocking's `is_blocked` parameter (blocking.go):
+// issueops.BlockingRequest.IncludeIsBlocked, which adds each item's stored,
+// transitive is_blocked flag to the decoration. It is the batched readiness
+// projection behind storage's IsBlockedBatch on a role-served backend
+// (issueops.BlockedFlags). The client refuses the read locally, naming this
+// token, against a server that does not advertise it.
+const CapDependenciesBlockingIsBlocked = "dependencies.blocking.isBlocked"
+
 // CapIssuesSweepWispsPlane is the behavior capability that advertises the
 // `wisps-plane` value of SweepRequest.tier (sweep.go, spec SweepRequest.tier):
 // a third, wider tier that clears the whole wisps table plus any durable bead
@@ -220,6 +229,33 @@ const CapBatchApplyDepAddLineage = "issues.batchApply.depAddLineage"
 // check (its target resolves on the server), so through an older server it
 // still edits a template (bd-jkp9v3).
 const CapIssuesUpdateAllowTemplate = "issues.update.allowTemplate"
+
+// CapIssuesUpdatePersistence is the behavior capability that advertises
+// IssuePatchBody.persistence on updateIssue: the role's
+// IssuePatch.Persistence, which moves the row between the durable and the wisp
+// plane in the update's own transaction. It is what `bd promote`
+// (issueops.Promote) and `bd update --persistent/--ephemeral/--no-history`
+// send over http. An older server answers the member with `400
+// invalid_argument`/`unknown_parameter`; a client that does not see this token
+// refuses the move before the dial, naming the token, rather than sending it.
+const CapIssuesUpdatePersistence = "issues.update.persistence"
+
+// CapIssuesUpdateClaim is the behavior capability that advertises
+// UpdateIssueRequest's `claim` member (update.go, upstream #6890): updateIssue
+// claims the row in the update's own transaction, through the same
+// Lifecycle.Update the direct route's `bd update --claim` runs, and resolves
+// the id on BOTH planes, so a wisp is claimable here where claimIssue (the
+// Claimer role) answers it not-found by contract. A claim combines with a
+// patch and with `expected_version` in one write and answers the post-write
+// `revision`; a wisp claim takes no lease.
+//
+// The member shipped untokened (it is on the pretoken request-body baseline),
+// so a client could only find it by eating the skew 400. The token makes that
+// a handshake read: a client that does not see it sends a claim alone to
+// claimIssue (where a wisp refuses by name, W-ClaimRequest.Wisp) and refuses a
+// claim beside anything else before the dial, naming this token. One token
+// covers both planes: no server has served `claim` on one plane only.
+const CapIssuesUpdateClaim = "issues.update.claim"
 
 // CapIssuesCreateDefaultPriority is the behavior capability that advertises
 // that issues.create, issues.batchCreate and issues.batchApply's create items
@@ -1034,7 +1070,7 @@ var behaviorCapabilities = []string{
 	CapIssuesSweepWispsPlane, CapIssuesSweepLiveDependents, CapIssuesSweepLimit,
 	CapBatchApplyDepAddLineage, CapIssuesUpdateAllowTemplate, CapIssuesCreateDefaultPriority,
 	CapIssuesCloseAutoCloseMolecule, CapIssuesListSearch,
-	CapIssuesListNoAssignee, CapIssuesListTitle, CapListIDs,
+	CapIssuesListNoAssignee, CapIssuesListTitle, CapListIDs, CapIssuesUpdatePersistence, CapDependenciesBlockingIsBlocked, CapIssuesUpdateClaim,
 }
 
 // Capabilities lists what this build advertises in ContextResponse.capabilities:

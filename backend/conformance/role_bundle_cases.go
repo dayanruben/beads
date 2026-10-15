@@ -127,6 +127,7 @@ var roleContractCases = []roleContract{
 		RunBlockingAnnotatorRefusesAnEmptyID,
 		RunBlockingAnnotatorLeavesTheRequestAlone,
 		RunBlockingAnnotatorWritesNothing,
+		RunBlockingAnnotatorReportsTheTransitiveBlockedFlag,
 	),
 
 	// One contract file covers both halves of workspace identity: the eight
@@ -488,6 +489,8 @@ var roleContractCases = []roleContract{
 		RunLifecycleUpdateParentIDReplacesTheParentEdge,
 		RunLifecycleUpdateParentIDReplacesEveryParent,
 		RunLifecycleUpdatePersistentPreservesUnversionedClass,
+		RunLifecycleUpdateWispModesRefuseAnUnversionedRow,
+		RunLifecycleUpdatePersistentPromotesAWisp,
 		RunLifecycleUpdateProvenanceLabelsHistory,
 		RunLifecycleUpdateRefusesATemplate,
 		RunLifecycleUpdateAllowTemplateEditsATemplate,

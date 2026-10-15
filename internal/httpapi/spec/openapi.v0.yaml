@@ -2495,11 +2495,6 @@ paths:
         Nothing has asked for it.
 
 
-        `persistence` — a plane move is an atomic aggregate migration rather
-        than a field write, and moving a row between planes mid-patch is a
-        different act from editing it.
-
-
         `closed_by_session` and `close_reason` — written under first-close-wins
         by `{id}:close`, which a patch write would bypass. A `status` that
         crosses into the done category still answers to close POLICY here; it
@@ -5650,6 +5645,25 @@ paths:
             maxItems: 100
             items:
               type: string
+        - name: is_blocked
+          in: query
+          description: >-
+            `true` adds each item's `is_blocked`: the issue's stored,
+            TRANSITIVE readiness flag — the column the ready set filters on,
+            which a child inherits from a blocked parent and which
+            `waits-for` and `conditional-blocks` gates set — rather than the
+            two-edge-type, direct `blocked_by` summary. It is the batched
+            readiness projection a client cache needs to answer readiness
+            with the server's own predicate. An id that names no row in
+            either plane gets no `is_blocked` member. Absent or `false`
+            answers exactly as before. Behind the
+            `dependencies.blocking.isBlocked` capability token; a server
+            that predates it answers `400` with `param: "is_blocked"` and
+            `reason: "unknown_parameter"`.
+          required: false
+          schema:
+            type: boolean
+            default: false
       security:
         - bearerToken: []
       responses:
@@ -8124,6 +8138,13 @@ components:
             carries several `parent-child` edges, which one appears here is not
             specified. A client that needs every structural edge reads them from
             `GET /v0/beads/dependencies`.
+        is_blocked:
+          type: boolean
+          description: >-
+            The issue's stored, transitive is_blocked flag — present only when
+            the request carried `is_blocked=true` (capability
+            `dependencies.blocking.isBlocked`) and the id names a row. Its
+            absence never means "not blocked".
 
     # ---------------------------------------------------------------------
     # Envelope schemas. Almost all of these have no canonical Go type behind
@@ -8287,6 +8308,11 @@ components:
             `PATCH /v0/beads/issues/{id}` accepts `allow_template` (see
             `UpdateIssueRequest`) rather than a `400` naming the member
             unknown, and
+            `issues.update.persistence`, which announces that
+            `PATCH /v0/beads/issues/{id}` accepts a `persistence` member in
+            its `patch` (see `IssuePatchBody`), the plane move behind
+            `bd promote`, rather
+            than a `400` naming the member unknown, and
             `issues.create.defaultPriority`, which announces that a create
             (`POST /v0/beads/issues`, `issues:batchCreate` and
             `issues:batchApply` create items) with no `priority` member stores
@@ -8299,13 +8325,20 @@ components:
             member unknown, `issues.list.search`, which announces that
             `GET /v0/beads/issues` accepts `q`, `bd search`'s free text (see
             that parameter), rather than silently answering
-            `unknown_parameter`, and `issues.list.noAssignee`,
+            `unknown_parameter`, `issues.list.noAssignee`,
             `issues.list.title` and `issues.list.ids`, which announce that
             `GET /v0/beads/issues` accepts `no_assignee`, `title` and the
             repeatable `id` respectively (`bd list --no-assignee`, `--title`
             and `--id`; see those parameters) rather than answering
-            `unknown_parameter`. One
-            behavior token is
+            `unknown_parameter`, `dependencies.blocking.isBlocked`, which
+            announces that `GET /v0/beads/dependencies/blocking` accepts
+            `is_blocked` and answers each item's stored, transitive
+            `is_blocked` flag (see that parameter) rather than silently
+            answering `unknown_parameter`, and `issues.update.claim`, which
+            announces that `PATCH /v0/beads/issues/{id}` accepts `claim` (see
+            `UpdateIssueRequest`) and resolves the claimed id on both planes,
+            so a wisp is claimable there, rather than a `400` naming the
+            member unknown. One behavior token is
             CONDITIONAL rather than build-level: `policy.external_dependencies`
             announces that this server's ready, claim, claim-next, close,
             blocking and dependency-tree operations already apply bd's
@@ -10500,9 +10533,11 @@ components:
         one-edge-one-spelling rule: a parent is a `dep_add` item of type
         `parent-child`, so the order of every edge in the request stays total.
         The single patch has no ordering to express and publishes it directly.
-        `persistence` is absent from both — moving a row between planes mid-plan
+        `persistence` is absent here — moving a row between planes mid-plan
         is a different act from writing its fields, and nothing has asked for it
-        here.
+        here. The single patch publishes it (`IssuePatchBody.persistence`,
+        behind `issues.update.persistence`), where the move is the patch's last
+        step.
       properties:
         title:
           type: string
@@ -11898,7 +11933,9 @@ components:
             included. With `claim: true` the `patch` may be empty. It must not
             be combined with `expected_assignee`, `expected_status` or
             `force_assignee_transfer`; a request that does is a `400` naming
-            `claim`.
+            `claim`. The id resolves on both planes, so a wisp is claimable
+            here (where `{id}:claim` answers it `404`); a wisp claim takes no
+            lease. Advertised by the behavior token `issues.update.claim`.
         expected_version:
           type: string
           description: >-
@@ -12201,6 +12238,29 @@ components:
           description: 'RFC 3339. Explicit `null` CLEARS the deferral.'
         metadata:
           $ref: '#/components/schemas/ApplyMetadataPatch'
+        persistence:
+          type: string
+          maxLength: 255
+          description: >-
+            One of `persistent`, `ephemeral` or `no_history`; any other value
+            is a `400` naming the member. Selects the issue's complete persistence state, moving the row
+            between the durable and the wisp plane when the state changes
+            plane. `persistent` promotes a wisp: the row keeps its id, and its
+            labels, dependencies, events and comments move with it, all in
+            this update's one transaction (`bd promote`, `bd update
+            --persistent`). `ephemeral` and `no_history` select the wisp
+            retention modes (`bd update --ephemeral` / `--no-history`);
+            demoting a durable row that has retained snapshots is refused.
+            The current mode is a no-op that reports `changed: false`.
+
+
+            A PLANE MOVE IS AN AGGREGATE MIGRATION, not a field write, and it
+            is applied LAST, after every other member of the patch, so the
+            edit and the move commit together or not at all. Advertised by the
+            `issues.update.persistence` capability token; a server that
+            predates the member refuses it as an unknown parameter, and a
+            client that does not see the token refuses the move before the
+            dial rather than sending it.
 
     UpdateIssueResponse:
       type: object
