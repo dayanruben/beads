@@ -19,8 +19,8 @@ import (
 
 // THE NAME IS LOAD-BEARING for the same reason TestEmbeddedVersionedHistorySwitchRoundTrip's is:
 // .github/scripts/embedded-test-shard.sh selects the tests the embedded job runs by
-// `grep -rh '^func TestEmbedded' cmd/bd/*_embedded_test.go`, so a test that keeps this prefix
-// and this file suffix runs in the one job that sets BEADS_TEST_EMBEDDED_DOLT=1.
+// `grep -rh '^func TestEmbedded' cmd/bd/*_test.go`, so a test that keeps this prefix runs in
+// the one job that sets BEADS_TEST_EMBEDDED_DOLT=1.
 //
 // TestEmbeddedVersionedHistorySwitchRefusesUnversionableMetadata drives the REAL
 // `bd config set versioned-history.enabled true` against a real store that already holds rows
@@ -432,5 +432,55 @@ func TestEmbeddedVersionedHistorySwitchRefusesAnUnrecordableGateTimeout(t *testi
 	bdConfig(t, bd, dir, "set", "versioned-history.enabled", "true")
 	if got := strings.TrimSpace(bdConfig(t, bd, dir, "get", "versioned-history.enabled")); !strings.HasPrefix(got, "true") {
 		t.Fatalf("after applying the remedies the switch did not turn on: config get says %q", got)
+	}
+}
+
+// TestEmbeddedConfigSetOtherKeysSkipTheVersionedHistoryScan pins that the pre-enable scan belongs
+// to versioned-history.enabled alone. In a store that holds a row the scan refuses over, `bd config
+// set` and `bd config set-many` of any other key -- given the value "true", which is what turns
+// the switch on -- exit 0, store the value, print no refusal and leave the switch off. The switch
+// itself is still refused afterwards, which proves the store held a row the scan would have named.
+//
+// TestEmbeddedVersionedHistorySwitchRefusesUnversionableMetadata pins that turning the switch OFF
+// never scans; this pins the other half of "any other key ... passes without reading a row"
+// (checkVersionedHistoryCanBeEnabled's doc comment) through the real commands.
+func TestEmbeddedConfigSetOtherKeysSkipTheVersionedHistoryScan(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+	// The offender below can only be written while nothing records versions. No t.Parallel:
+	// t.Setenv is incompatible.
+	t.Setenv(vhEnvVar, "")
+
+	bd := buildEmbeddedBD(t)
+	dir, _, _ := bdInit(t, bd, "--prefix", "vso")
+
+	offender := bdCreateSilent(t, bd, dir, "holds an integer past 2^53", "--metadata", `{"n":9007199254740993}`)
+
+	for _, args := range [][]string{
+		{"config", "set", "custom.vso-marker", "true"},
+		{"config", "set-many", "custom.vso-batch=true"},
+	} {
+		stdout, stderr, exit := bdRunStreams(t, bd, dir, args...)
+		if exit != 0 {
+			t.Fatalf("bd %s exited %d in a store holding %s; the scan must not run for this key\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), exit, offender, stdout, stderr)
+		}
+		if out := stdout + stderr; strings.Contains(out, "cannot turn versioned history on") || strings.Contains(out, offender) {
+			t.Errorf("bd %s printed the versioned-history refusal for a key that is not the switch:\n%s", strings.Join(args, " "), out)
+		}
+	}
+	for key, want := range map[string]string{"custom.vso-marker": "true", "custom.vso-batch": "true"} {
+		if got := strings.TrimSpace(bdConfig(t, bd, dir, "get", key)); got != want {
+			t.Errorf("config get %s = %q, want %q", key, got, want)
+		}
+	}
+	if got := strings.TrimSpace(bdConfig(t, bd, dir, "get", "versioned-history.enabled")); strings.HasPrefix(got, "true") {
+		t.Fatalf("setting other keys turned versioned history on: config get says %q", got)
+	}
+
+	// The control: the scan does see the offender when the switch itself is set.
+	out, _ := bdRunFailCode(t, bd, dir, "config", "set", "versioned-history.enabled", "true")
+	if !strings.Contains(out, offender) {
+		t.Fatalf("the refused switch does not name %s, so the pin above proves nothing:\n%s", offender, out)
 	}
 }
