@@ -16,7 +16,6 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/routing"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
 	"github.com/steveyegge/beads/internal/types"
@@ -32,21 +31,24 @@ import (
 // shape: runContributorWizard creates an empty .beads, and
 // autoConfigureForkContributor a database with no metadata.json and no
 // issue_prefix. migrate-personal's own error text sends users to those setups,
-// so their repos must be migratable into. An empty .beads is initialized the
-// way a routed bd create initializes it (ensureBeadsDirForPath, with the
-// project store supplying the prefix). One that already holds a database keeps
-// it (adoptPlanningDatabase): a new database beside it would hide whatever it
-// holds. A repo that already has a metadata.json (a clone not yet
+// so their repos must be migratable into. It is initialized by the rule a
+// routed bd create applies (ensureBeadsDirForPath, with the project store
+// supplying the prefix): an empty .beads gets a database named after the
+// prefix, and one that already holds a database keeps it
+// (adoptPlanningDatabase), since a new database beside it would hide whatever
+// it holds. A repo that already has a metadata.json (a clone not yet
 // bootstrapped, say) is left as it is.
 //
-// Any other metadata-less .beads is initialized the same way, except the shapes
-// refused before anything is written (refuseUninitializablePlanningRepo): any
-// workspace bd's own command admission refuses there
-// (guardLegacyUpgradeWorkspace), such as a SQLite-era repo, whose data a fresh
-// database beside it would hide, and one holding several databases, where
-// nothing records which one bd uses. A redirect stub is refused whether or not
-// it has a metadata.json of its own: bd run in the planning repo follows the
-// redirect, so it never reads a database inside the stub.
+// The shapes that rule refuses are refused before anything is written
+// (refuseUninitializablePlanningRepo, refuseUninitializableTarget): a planning
+// repo whose own config selects Dolt server mode, whose server data an
+// embedded metadata.json would hide; any workspace bd's own command admission
+// refuses there (guardLegacyUpgradeWorkspace), such as a SQLite-era repo,
+// whose data a fresh database beside it would hide; and one holding several
+// databases, where nothing records which one bd uses. A redirect stub is
+// refused whether or not it has a metadata.json of its own: bd run in the
+// planning repo follows the redirect, so it never reads a database inside the
+// stub.
 //
 // The planning repo is the contributor auto-route target, so it then opens the
 // way a write auto-routed there does (openAutoRoutedStore): its own
@@ -111,7 +113,7 @@ func settlePlanningWorkingSet(ctx context.Context, planningStore storage.DoltSto
 			return fmt.Errorf("failed to commit the planning repo's initialization: %w", err)
 		}
 	}
-	return refuseUncommittedPlanningChanges(ctx, planningStore, planningRepo)
+	return refuseUncommittedPlanningChanges(ctx, planningStore, planningRepo, "")
 }
 
 // refuseUncommittedPlanningChanges refuses a planning store whose working set
@@ -122,33 +124,56 @@ func settlePlanningWorkingSet(ctx context.Context, planningStore storage.DoltSto
 // batch or off deferred or changes the user means to discard. Dolt-ignored
 // tables, such as wisps, are not in the working-set status, and the commit
 // leaves them out too. It writes nothing.
-func refuseUncommittedPlanningChanges(ctx context.Context, planningStore storage.DoltStorage, planningRepo string) error {
+//
+// The remedy it names is bd dolt commit in the planning repo. unnamedDatabase
+// is set when the store is a database no metadata.json names yet and that is
+// not the default database (adoptPlanningDatabase): bd run in the planning
+// repo then opens the default database, so bd dolt commit reaches this one
+// only once a metadata.json names it, and the remedy says so.
+func refuseUncommittedPlanningChanges(ctx context.Context, planningStore storage.DoltStorage, planningRepo, unnamedDatabase string) error {
 	commits, err := commitsPlanningWrites(planningStore)
 	if err != nil || !commits {
 		return err
 	}
-	status, err := planningStore.Status(ctx)
+	tables, err := uncommittedTables(ctx, planningStore)
 	if err != nil {
 		return fmt.Errorf("failed to read the planning repo's uncommitted changes: %w", err)
+	}
+	if len(tables) == 0 {
+		return nil
+	}
+	remedy := "commit them there with `bd dolt commit`, then rerun"
+	if unnamedDatabase != "" {
+		remedy = fmt.Sprintf("bd run there opens the database %[1]q only once a metadata.json names it, so give it a .beads/metadata.json whose dolt_database is %[1]q, commit them there with `bd dolt commit`, then rerun", unnamedDatabase)
+	}
+	return refusePlanningRepo("planning repo %s has uncommitted changes (%s), which migrate-personal's commit would publish; %s; nothing was moved", planningRepo, strings.Join(tables, ", "), remedy)
+}
+
+// uncommittedTables lists the tables with staged or unstaged changes in st's
+// working set, sorted, each once. Dolt-ignored tables are not in it.
+func uncommittedTables(ctx context.Context, st storage.DoltStorage) ([]string, error) {
+	status, err := st.Status(ctx)
+	if err != nil {
+		return nil, err
 	}
 	var tables []string
 	for _, entry := range slices.Concat(status.Staged, status.Unstaged) {
 		tables = append(tables, entry.Table)
 	}
-	if len(tables) == 0 {
-		return nil
-	}
 	slices.Sort(tables)
-	return fmt.Errorf("planning repo %s has uncommitted changes (%s), which migrate-personal's commit would publish; commit them there with `bd dolt commit`, then rerun; nothing was moved", planningRepo, strings.Join(slices.Compact(tables), ", "))
+	return slices.Compact(tables), nil
 }
 
 // refuseUninitializablePlanningRepo refuses a planning .beads that
 // openMigrationPlanningStore must not open or initialize: a redirect stub, with
-// or without a metadata.json of its own, and, when it has no metadata.json, a
-// workspace guardLegacyUpgradeWorkspace refuses or one holding several
-// databases. Every other metadata-less .beads is left to
+// or without a metadata.json of its own, and, when it has no metadata.json,
+// one a routed bd create would not initialize either (refuseUninitializableTarget:
+// its own config selects Dolt server mode, bd's own admission refuses it, or
+// it holds several databases). Every other metadata-less .beads is left to
 // initializePlanningRepo. It writes nothing. A .beads that has a metadata.json
-// is left to the open, which refuses what it cannot use.
+// is left to the open, which refuses what it cannot use. A targetRefusal is
+// raised as a planningRepoRefusal naming the planning repo; bd's admission
+// refusals are returned as they are, for planningOpenError to render.
 func refuseUninitializablePlanningRepo(planningBeadsDir string) error {
 	if redirect := beads.ResolveRedirect(planningBeadsDir); utils.CanonicalizePath(redirect.TargetDir) != utils.CanonicalizePath(planningBeadsDir) {
 		return redirectedPlanningRepoError(planningBeadsDir, redirect.TargetDir, redirect.SourceDatabase)
@@ -156,17 +181,13 @@ func refuseUninitializablePlanningRepo(planningBeadsDir string) error {
 	if _, err := os.Stat(filepath.Join(planningBeadsDir, "metadata.json")); err == nil {
 		return nil
 	}
-	if err := guardLegacyUpgradeWorkspace(planningBeadsDir); err != nil {
-		return err
+	err := refuseUninitializableTarget(planningBeadsDir)
+	var refusal *targetRefusal
+	if errors.As(err, &refusal) {
+		// Its message starts with the planning repo's path.
+		return refusePlanningRepo("planning repo %s", refusal.msg)
 	}
-	// With no metadata.json, bd names the database it opens in the planning
-	// repo after BEADS_DOLT_SERVER_DATABASE when that is set and the default
-	// database otherwise, so among several nothing records which one holds
-	// the planning issues.
-	if databases := embeddeddolt.Databases(planningBeadsDir); len(databases) > 1 {
-		return fmt.Errorf("planning repo %s has no metadata.json and holds several databases (%s); give it a metadata.json whose dolt_database names the one to use, then rerun", filepath.Dir(planningBeadsDir), strings.Join(databases, ", "))
-	}
-	return nil
+	return err
 }
 
 // redirectedPlanningRepoError refuses a planning .beads that redirects to
@@ -180,10 +201,10 @@ func redirectedPlanningRepoError(planningBeadsDir, target, stubDatabase string) 
 	planningRepo, targetRepo := filepath.Dir(planningBeadsDir), filepath.Dir(target)
 	if stubDatabase != "" {
 		if targetDatabase, err := autoRouteTargetDatabase(target, true); err != nil || targetDatabase != stubDatabase {
-			return fmt.Errorf("planning repo %s redirects to %s, where bd uses the database %q that the planning repo names; routing.contributor cannot select that database (set to %s, it selects that repository's own)", planningRepo, targetRepo, stubDatabase, targetRepo)
+			return refusePlanningRepo("planning repo %s redirects to %s, where bd uses the database %q that the planning repo names; routing.contributor cannot select that database (set to %s, it selects that repository's own); set routing.contributor to a separate planning repository (e.g. ~/.beads-planning)", planningRepo, targetRepo, stubDatabase, targetRepo)
 		}
 	}
-	return fmt.Errorf("planning repo %s redirects to %s; set routing.contributor to that repository instead", planningRepo, targetRepo)
+	return refusePlanningRepo("planning repo %s redirects to %s; set routing.contributor to that repository instead", planningRepo, targetRepo)
 }
 
 // initializePlanningRepo gives a planning .beads that refuseUninitializablePlanningRepo
@@ -202,99 +223,69 @@ func initializePlanningRepo(ctx context.Context, planningBeadsDir string, projec
 	return statErr != nil, ensureBeadsDirForPath(ctx, filepath.Dir(planningBeadsDir), projectStore, true)
 }
 
-// adoptPlanningDatabase writes the metadata.json a routed bd create writes
-// (ensureBeadsDirForPath) for a planning .beads that has none but already
-// holds one embedded database, naming that database instead of creating one
-// named after the project prefix beside it. It is the database fork setup
-// creates (autoConfigureForkContributor), and the one a routed open uses until
-// a metadata.json names another (autoRouteTargetDatabase); a new database
-// beside it would hide whatever it holds, from bd run in the planning repo and
-// from the migration's own phase 0. The database keeps its issue_prefix and
-// project identity (planningDatabaseSettings). A database whose working set
-// already holds changes is refused first, with nothing written
+// adoptPlanningDatabase adopts the one embedded database a planning .beads
+// with no metadata.json holds, as a routed bd create does (adoptTargetDatabase),
+// so the issues it already holds stay visible, to bd run in the planning repo
+// and to the migration's own phase 0. A database whose working set already
+// holds changes is refused first, with nothing written
 // (refuseUncommittedPlanningChanges): the initialization commit
 // (settlePlanningWorkingSet) would publish them.
 func adoptPlanningDatabase(ctx context.Context, planningBeadsDir, database string, projectStore storage.DoltStorage) error {
-	planningStore, err := newDoltStore(ctx, &dolt.Config{BeadsDir: planningBeadsDir, Database: database})
-	if err != nil {
-		return fmt.Errorf("failed to open planning database %q: %w", database, err)
+	var unnamed string
+	if database != configfile.DefaultDoltDatabase {
+		unnamed = database
 	}
-	var projectID string
-	err = refuseUncommittedPlanningChanges(ctx, planningStore, filepath.Dir(planningBeadsDir))
-	if err == nil {
-		projectID, err = planningDatabaseSettings(ctx, planningStore, projectStore)
-	}
-	if closeErr := planningStore.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	cfg := configfile.DefaultConfig()
-	cfg.Backend = configfile.BackendDolt
-	cfg.DoltDatabase = database
-	cfg.DoltMode = configfile.DoltModeEmbedded
-	cfg.ProjectID = projectID
-	if err := cfg.Save(planningBeadsDir); err != nil {
-		return fmt.Errorf("failed to write metadata.json: %w", err)
-	}
-	return nil
-}
-
-// planningDatabaseSettings gives an adopted planning database the project's
-// issue_prefix when it has none, as ensureBeadsDirForPath gives the database it
-// creates (a routed bd create into it needs one), and returns the project_id
-// its metadata.json is to carry: the database's own _project_id when it has
-// one, which bd's workspace identity check compares that field with
-// (validateWorkspaceIdentity), else a new one.
-func planningDatabaseSettings(ctx context.Context, planningStore, projectStore storage.DoltStorage) (string, error) {
-	prefix, err := planningStore.GetConfig(ctx, "issue_prefix")
-	if err != nil {
-		return "", fmt.Errorf("failed to read the planning database's issue_prefix: %w", err)
-	}
-	if prefix == "" {
-		if projectPrefix, err := projectStore.GetConfig(ctx, "issue_prefix"); err == nil && projectPrefix != "" {
-			if err := planningStore.SetConfig(ctx, "issue_prefix", projectPrefix); err != nil {
-				return "", fmt.Errorf("failed to set prefix in planning store: %w", err)
-			}
-		}
-	}
-	projectID, err := planningStore.GetMetadata(ctx, "_project_id")
-	if err != nil {
-		return "", fmt.Errorf("failed to read the planning database's project identity: %w", err)
-	}
-	if projectID == "" {
-		projectID = configfile.GenerateProjectID()
-	}
-	return projectID, nil
+	return adoptTargetDatabase(ctx, planningBeadsDir, database, projectStore, func(planningStore storage.DoltStorage) error {
+		return refuseUncommittedPlanningChanges(ctx, planningStore, filepath.Dir(planningBeadsDir), unnamed)
+	})
 }
 
 // refuseSelfPlanningRepo refuses a planning repo that is the project workspace
 // itself (routing.contributor set to the project's path, or to ".", the value
-// routing.maintainer and routing.default default to). The migration copies each
-// issue into the planning store and then deletes it from the project; when both
-// are the same database the copy is a no-op and the delete removes the only
-// copy. The planning .beads directory (after any redirect) is compared with the
-// project's, and the two metadata.json project_id values when both are set.
+// routing.maintainer and routing.default default to), or a clone of it. The
+// migration copies each issue into the planning store and then deletes it from
+// the project; when both are the same database the copy is a no-op and the
+// delete removes the only copy.
+//
+// The planning .beads directory (after any redirect) is compared with the
+// project's. The same directory is the project's own workspace unless the
+// planning repo is a redirect stub that names a database of its own, other
+// than the one the project's store uses there: a rig beside the project under
+// a shared root (beads.ResolveRedirect). That stub is a different database,
+// and is refused as the redirect it is (redirectedPlanningRepoError).
+// Two directories whose metadata.json carry the same project_id are one
+// project's workspaces, a clone sharing the git-tracked metadata.json: a
+// separate planning repository has an identity of its own.
 func refuseSelfPlanningRepo(planningPath, planningBeadsDir, projectBeadsDir string) error {
 	if projectBeadsDir == "" {
 		return nil
 	}
-	planning := utils.CanonicalizePath(beads.FollowRedirect(planningBeadsDir))
+	redirect := beads.ResolveRedirect(planningBeadsDir)
+	planning := utils.CanonicalizePath(redirect.TargetDir)
 	project := utils.CanonicalizePath(beads.FollowRedirect(projectBeadsDir))
-	same := planning == project
-	if !same {
-		// LoadForDiscovery, not Load: Load migrates a legacy config.json to
-		// metadata.json, and this check runs before the confirmation prompt
-		// and before any format admission, so it must not rewrite either
-		// workspace.
-		planningCfg, perr := configfile.LoadForDiscovery(planning)
-		projectCfg, qerr := configfile.LoadForDiscovery(project)
-		same = perr == nil && qerr == nil && planningCfg != nil && projectCfg != nil &&
-			planningCfg.ProjectID != "" && planningCfg.ProjectID == projectCfg.ProjectID
-	}
-	if same {
+	// LoadForDiscovery, not Load: Load migrates a legacy config.json to
+	// metadata.json, and this check runs before the confirmation prompt and
+	// before any format admission, so it must not rewrite either workspace.
+	projectCfg, qerr := configfile.LoadForDiscovery(project)
+	if planning == project {
+		// The database the project's store opened: BEADS_DOLT_SERVER_DATABASE,
+		// which preserveRedirectSourceDatabase sets for a launch through a
+		// redirect, outranks the shared metadata.json (GetDoltDatabase).
+		projectDatabase := configfile.DefaultConfig().GetDoltDatabase()
+		if qerr == nil && projectCfg != nil {
+			projectDatabase = projectCfg.GetDoltDatabase()
+		}
+		if redirect.WasRedirected && redirect.SourceDatabase != "" && redirect.SourceDatabase != projectDatabase {
+			// Refused here, before the confirmation prompt, rather than by
+			// refuseUninitializablePlanningRepo after it.
+			return redirectedPlanningRepoError(planningBeadsDir, redirect.TargetDir, redirect.SourceDatabase)
+		}
 		return fmt.Errorf("planning repo %s is this project's own workspace; set routing.contributor to a separate planning repository (e.g. ~/.beads-planning)", planningPath)
+	}
+	planningCfg, perr := configfile.LoadForDiscovery(planning)
+	if perr == nil && qerr == nil && planningCfg != nil && projectCfg != nil &&
+		planningCfg.ProjectID != "" && planningCfg.ProjectID == projectCfg.ProjectID {
+		return fmt.Errorf("planning repo %s has this project's project_id (%s), so it is a clone of this project's workspace, not a separate planning repository; set routing.contributor to a separate planning repository (e.g. ~/.beads-planning)", planningPath, planningCfg.ProjectID)
 	}
 	return nil
 }
@@ -316,8 +307,10 @@ The command:
 EXAMPLES:
   bd migrate-personal        # Interactive: show list and prompt
   bd migrate-personal -y     # Non-interactive: skip confirmation`,
-	GroupID: "setup",
-	RunE:    runMigratePersonal,
+	GroupID:       "setup",
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE:          runMigratePersonal,
 }
 
 var migratePersonalYes bool
@@ -394,7 +387,7 @@ func runMigratePersonal(cmd *cobra.Command, args []string) error {
 	// workspace's. See openMigrationPlanningStore.
 	planningStore, err := openMigrationPlanningStore(ctx, planningBeadsDir, store, identity)
 	if err != nil {
-		return planningOpenError(cmd, planningPath, err)
+		return planningOpenError(planningPath, err)
 	}
 	defer func() { _ = planningStore.Close() }()
 
@@ -447,20 +440,37 @@ func confirmMigratePersonal(ctx context.Context, n int) bool {
 	return true
 }
 
-// planningOpenError renders a failed openMigrationPlanningStore. A planning
-// repo bd's own command admission refuses (an unsupported format, a legacy
-// store) is rendered as that refusal is, naming the planning repo: the Error
-// line, plus the Hint line and exit 16 for a format. Nothing was opened, so it
-// carries no "failed to open planning store" prefix, and cobra is silenced for
-// this invocation (the migrationFreezeGate pattern), so neither "Error: exit
-// code N" nor a usage dump follows it.
-func planningOpenError(cmd *cobra.Command, planningPath string, err error) error {
-	if !isUnsupportedWorkspaceFormat(err) && !isLegacyUpgradeRefusal(err) {
-		return fmt.Errorf("failed to open planning store at %s: %w", planningPath, err)
+// planningRepoRefusal is openMigrationPlanningStore refusing the planning repo
+// before anything moves: a redirect stub, a metadata-less one a routed bd
+// create would not initialize either (its own config selects Dolt server
+// mode, or it holds several databases with nothing naming one), or a working
+// set the migration's commit would publish. Its message names the planning
+// repo and the remedy.
+type planningRepoRefusal struct{ msg string }
+
+func (r *planningRepoRefusal) Error() string { return r.msg }
+
+func refusePlanningRepo(format string, args ...any) error {
+	return &planningRepoRefusal{msg: fmt.Sprintf(format, args...)}
+}
+
+// planningOpenError renders a failed openMigrationPlanningStore. A refusal of
+// the planning repo (planningRepoRefusal) is returned as it is: nothing
+// failed to open, so it carries no "failed to open planning store" prefix. A
+// planning repo bd's own command admission refuses (an unsupported format, a
+// legacy store) is rendered as that refusal is, naming the planning repo: the
+// Error line, plus the Hint line and exit 16 for a format. migratePersonalCmd
+// silences cobra, so neither "Error: exit code N" nor a usage dump follows
+// either.
+func planningOpenError(planningPath string, err error) error {
+	var refusal *planningRepoRefusal
+	switch {
+	case errors.As(err, &refusal):
+		return refusal
+	case isUnsupportedWorkspaceFormat(err) || isLegacyUpgradeRefusal(err):
+		return handleWorkspaceGuardError(fmt.Errorf("planning repo %s: %w", planningPath, err))
 	}
-	cmd.SilenceErrors = true
-	cmd.SilenceUsage = true
-	return handleWorkspaceGuardError(fmt.Errorf("planning repo %s: %w", planningPath, err))
+	return fmt.Errorf("failed to open planning store at %s: %w", planningPath, err)
 }
 
 // refuseIssuesAlreadyInPlanning is phase 0 of runMigratePersonal: it refuses
@@ -561,7 +571,7 @@ func copyIssuesToPlanning(ctx context.Context, src, dst storage.DoltStorage, per
 	err := commitPlanningWrites(ctx, dst, formatDoltAutoCommitMessage("migrate-personal", actor, created))
 	switch {
 	case errors.Is(err, storage.ErrCommitIndeterminate):
-		return nil, fmt.Errorf("committing the copy in the planning repo may have failed: %w; the copy is left there and nothing was deleted from the project DB, so run `bd dolt commit` in the planning repo, then resolve the duplicate manually", err)
+		return nil, fmt.Errorf("committing the copy in the planning repo may have failed: %w; the copy of %s is left there and nothing was deleted from the project DB, so run `bd dolt commit` in the planning repo, then resolve the duplicates manually", err, strings.Join(created, ", "))
 	case err != nil:
 		return rollback(fmt.Errorf("failed to commit the copy in the planning repo: %w", err))
 	}
